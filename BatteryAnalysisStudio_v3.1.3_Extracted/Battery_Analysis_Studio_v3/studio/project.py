@@ -101,7 +101,7 @@ def load_project(path: str) -> dict:
 def _save_compact_sources(destination, channels, sources):
     from shutil import copytree
     from .compact_data import CompactStore
-    if not channels or not all(isinstance(channel.frame, CompactStore) for channel in channels):
+    if not channels or not all(isinstance(getattr(channel, "frame", None), CompactStore) for channel in channels):
         return
     parent = destination.with_name(destination.name + ".data")
     parent.mkdir(exist_ok=True)

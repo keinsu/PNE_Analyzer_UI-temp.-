@@ -248,14 +248,14 @@ class StudioWindow(QMainWindow):
         raw_detail_layout = QVBoxLayout(raw_detail)
         raw_detail_layout.setContentsMargins(0, 0, 0, 0)
         pages = QHBoxLayout()
-        pages.addWidget(QLabel('원본 데이터 페이지'))
+        pages.addWidget(QLabel('곡선 데이터 페이지'))
         self.raw_detail_page = QSpinBox()
         self.raw_detail_page.setRange(1, 1)
         pages.addWidget(self.raw_detail_page)
         pages.addStretch()
         raw_detail_layout.addLayout(pages)
         raw_detail_layout.addWidget(self.source_table)
-        self.raw_tables.addTab(raw_detail, '원본 데이터')
+        self.raw_tables.addTab(raw_detail, '곡선 데이터')
         self.raw_detail_page.valueChanged.connect(self._load_raw_detail)
         self.raw.table_toggle.toggled.disconnect()
         self.raw.table_toggle.toggled.connect(self._toggle_raw_details)
@@ -1363,7 +1363,7 @@ class StudioWindow(QMainWindow):
         channel = self.active_channel()
         if channel is None:
             return
-        path, _ = QFileDialog.getSaveFileName(self, '활성 채널 원본 데이터 저장', str(Path(default_output_dir()) / 'raw.csv'), 'CSV (*.csv)')
+        path, _ = QFileDialog.getSaveFileName(self, '활성 채널 곡선 데이터 저장', str(Path(default_output_dir()) / 'raw.csv'), 'CSV (*.csv)')
         if path:
             self._start('export', lambda progress, cancel: self._write_csv(channel, path, cancel),
                         lambda _: self.statusBar().showMessage(f'Raw CSV 저장 완료 · {path}'))

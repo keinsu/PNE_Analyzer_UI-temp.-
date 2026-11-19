@@ -175,7 +175,7 @@ def prepare_channel(channel, root, cancel=None, *, components=()):
             file.replace(data / file.name)
         if any(_cache_read(data, f"summary-{label}") is None for label in (0, 1)):
             raise OSError("Cycle 요약을 저장할 수 없습니다.")
-        metadata = dict(channel.metadata, compact_curves=True, original_rows=channel.row_count,
+        metadata = dict(channel.metadata, compact_curves=True, disk_backed=True, original_rows=channel.row_count,
                         parse_fingerprint=channel.fingerprint + '-compact-v1')
         _cache_write(data, "channel", (pd.DataFrame(), channel.steps,
                                      {"metadata": metadata, "fixed_dcr": fixed_dcr}, channel.warnings), cancel)

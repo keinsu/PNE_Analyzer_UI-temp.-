@@ -7,10 +7,11 @@ import numpy as np
 import pandas as pd
 
 from studio.analysis import raw_curves, derivative_curves
-from studio.compact_data import DCR_TIMES, compact_curves, prepare_channel
+from studio.compact_data import DCR_TIMES, _dcr_snapshot, compact_curves, prepare_channel
 from studio.models import ChannelData
 from studio.project import load_project, project_channels, save_project
 from backend.dcr_analysis import _stored_pulse_result
+from tests.test_dcr_v3 import pulse_fixture
 
 
 def measurements():
@@ -52,6 +53,18 @@ class CompactProjectTests(unittest.TestCase):
         for name in ("Voltage_V", "Current_mA", "StepTime_s", "Capacity_mAh"):
             np.testing.assert_allclose(compact[name].iloc[[0, -1]], frame[name].iloc[[0, -1]])
         self.assertTrue(np.all(np.diff(compact["StepTime_s"]) > 0))
+
+    def test_original_pulse_is_sampled_at_import(self):
+        frame = pulse_fixture()
+        frame = frame[~((frame["StepNo"] == "2") & (frame["StepTime_s"] == .1))]
+        channel = ChannelData("a", "pulse", "source", frame)
+        detection = _dcr_snapshot(channel, False, None)
+        pulse = detection["blocks"][0]["pulse_groups"][0]["pulses"][0]
+        stored = _stored_pulse_result(pulse["fixed_dcr"], DCR_TIMES)
+        self.assertAlmostEqual(stored["r_by_t"][1.0], .02 * 1_000_000 / 1010)
+        self.assertTrue(np.isnan(stored["r_by_t"][0.1]))
+        self.assertTrue(np.isnan(stored["r_by_t"][0.5]))
+        self.assertTrue(np.isnan(stored["r_by_t"][60.0]))
 
     def test_saved_dcr_marks_missing_points(self):
         stored = dict(r_by_t={"0.1": None, "1.0": 10}, v_by_t={"1.0": 3.9},
