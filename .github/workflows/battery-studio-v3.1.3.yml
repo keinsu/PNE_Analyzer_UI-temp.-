@@ -40,7 +40,7 @@ jobs:
                   raise SystemExit(f'Source checksum mismatch: {name}')
           PY
       - name: Install pinned build dependencies
-        run: python -m pip install -r requirements.txt pyinstaller-hooks-contrib==2026.0
+        run: python -m pip install -r requirements.txt pyinstaller-hooks-contrib==2026.0 psutil==7.2.2
       - name: Run tests, build one EXE, and check the packaged app
         shell: cmd
         run: call build_onefile.bat
