@@ -72,6 +72,27 @@ def _cc_region_only(v: np.ndarray, q: np.ndarray, upper_voltage_v: float | None,
     return v[: cutoff + 1], q[: cutoff + 1]
 
 
+def compact_voltage_curve(voltage, capacity, intervals):
+    """Keep the 1 mV grid and measured points needed to reproduce Q(V)."""
+    grid = np.linspace(voltage[0], voltage[-1], intervals + 1)
+    values = np.interp(grid, voltage, capacity)
+    tolerance = max(float(np.ptp(capacity)) * 1e-4, 1e-9)
+    knots, charges = grid, values
+    bins = np.minimum(np.searchsorted(grid, voltage, side="right") - 1, intervals - 1)
+    while True:
+        error = np.abs(capacity - np.interp(voltage, knots, charges))
+        candidates = np.flatnonzero(error > tolerance)
+        if not len(candidates):
+            return knots, charges
+        # Add at most one measured point per cell on each pass.
+        order = candidates[np.argsort(-error[candidates], kind="stable")]
+        _, first = np.unique(bins[order], return_index=True)
+        selected = order[first]
+        combined = np.argsort(np.r_[knots, voltage[selected]], kind="stable")
+        knots = np.r_[knots, voltage[selected]][combined]
+        charges = np.r_[charges, capacity[selected]][combined]
+
+
 def compute_dqdv(
     df: pd.DataFrame,
     cycle: int,
@@ -84,6 +105,7 @@ def compute_dqdv(
     peak_min_distance: int = 5,
     peak_prominence_pct: float | None = None,
     upper_voltage_v: float | None = None,
+    compact_intervals: int | None = None,
 ):
     """
     한 사이클의 충전 또는 방전 dQ/dV, dV/dQ를 계산한다.
@@ -114,6 +136,10 @@ def compute_dqdv(
     v_u, q_u = _dedup_monotonic(v, q)
     if len(v_u) < 5:
         return None
+    compact = None
+    if compact_intervals is not None:
+        compact = compact_voltage_curve(v_u, q_u, compact_intervals)
+        v_u, q_u = compact
     v_grid = np.linspace(v_u.min(), v_u.max(), n_points)
     q_on_vgrid = np.interp(v_grid, v_u, q_u)
 
@@ -179,6 +205,7 @@ def compute_dqdv(
         peak_dqdv=dqdv[peak_idx],
         peak_capacity=q_grid[peak_idx_v],
         peak_dvdq=dvdq[peak_idx_v],
+        **(dict(compact_voltage=compact[0], compact_capacity=compact[1]) if compact else {}),
     )
 
 

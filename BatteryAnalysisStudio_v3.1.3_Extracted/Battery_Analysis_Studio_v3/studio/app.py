@@ -23,7 +23,8 @@ from PySide6.QtWidgets import (
 from . import APP_VERSION
 from .widgets import CurvePlot, DataTable, PALETTE, cycle_color, display_value
 from .ingestion import load_inputs
-from .analysis import apply_cycle_baseline, prepare_cycle_tables, raw_curves, derivative_curves, track_peaks
+from .analysis import apply_cycle_baseline, prepare_cycle_tables, raw_curves, track_peaks
+from .derivative_cache import cached_derivatives
 from .project import save_project, load_project, default_output_dir
 from .dcr_panel import DCRPanel
 from .raw_store import PREVIEW_POINTS
@@ -406,8 +407,9 @@ class StudioWindow(QMainWindow):
         self.dq_step = QLineEdit()
         self.dq_step.setPlaceholderText('자동: 가장 긴 유효 Step')
         self.dq_points = QSpinBox()
-        self.dq_points.setRange(50, 20000)
-        self.dq_points.setValue(500)
+        self.dq_points.setRange(0, 20000)
+        self.dq_points.setSpecialValueText('자동 (약 1 mV)')
+        self.dq_points.setValue(0)
         self.dq_smooth = QCheckBox('Savitzky–Golay 사용')
         self.dq_smooth.setChecked(True)
         self.dq_window = QSpinBox()
@@ -628,7 +630,7 @@ class StudioWindow(QMainWindow):
             self.raw.graph.set_stale(True)
 
     def reset_derivative_settings(self):
-        self.dq_points.setValue(500)
+        self.dq_points.setValue(0)
         self.dq_smooth.setChecked(True)
         self.dq_window.setValue(0)
         self.dq_order.setValue(3)
@@ -829,9 +831,23 @@ class StudioWindow(QMainWindow):
                 self.refresh_current()
         import tempfile
         cache_dir = str(Path(tempfile.gettempdir()) / 'BatteryAnalysisStudio3' / 'cache')
-        self._start('load', lambda progress, cancel: load_inputs(paths, progress=progress, cancel=cancel,
-                                                               cache_dir=cache_dir, csv_options=csv_options,
-                                                               disk_backed=True), loaded)
+        settings = self.derivative_settings()
+        settings.pop('peak_track_shift_mv')
+
+        def load(progress, cancel):
+            channels = load_inputs(paths, progress=progress, cancel=cancel, cache_dir=cache_dir,
+                                   csv_options=csv_options, disk_backed=True)
+            if channels and channels[0].cycles:
+                first = channels[0]
+                progress(0, 1, f'기본 미분 곡선 준비 · {first.name}')
+                try:
+                    cached_derivatives(first, [first.cycles[0]], settings, cancel)
+                except ValueError:
+                    # Import remains available when this selection has no usable curve.
+                    pass
+            return channels
+
+        self._start('load', load, loaded)
 
     def refresh_current(self):
         if not self.channels:
@@ -1055,7 +1071,7 @@ class StudioWindow(QMainWindow):
             self._start('analysis', calculate, ready)
 
     def derivative_settings(self):
-        return dict(direction=self.dq_direction.currentData(), n_points=self.dq_points.value(),
+        return dict(direction=self.dq_direction.currentData(), n_points=max(50, self.dq_points.value()) if self.dq_points.value() else 0,
             smooth=self.dq_smooth.isChecked(), smooth_window=self.dq_window.value() or None,
             smooth_polyorder=self.dq_order.value(), peak_prominence_pct=self.dq_peak.value() / 100.,
             peak_min_distance_mv=self.dq_peak_distance.value() or None,
@@ -1078,7 +1094,7 @@ class StudioWindow(QMainWindow):
                     raise InterruptedError('미분 분석 취소')
                 progress(i, len(channels), f'미분 분석 · {channel.name}')
                 try:
-                    result.extend(derivative_curves(channel, cycles, cancel=cancel, **settings))
+                    result.extend(cached_derivatives(channel, cycles, settings, cancel))
                 except InterruptedError:
                     raise
                 except Exception as exc:
@@ -1197,7 +1213,7 @@ class StudioWindow(QMainWindow):
             self.dq_cycles.setText(str(dq.get('cycles', '1')))
             self.dq_step.setText(str(dq.get('step', '')))
             self.dq_direction.setCurrentIndex(max(0, self.dq_direction.findData(dq.get('direction', 'both'))))
-            self.dq_points.setValue(int(dq.get('n_points', 500)))
+            self.dq_points.setValue(int(dq.get('n_points', 0)))
             self.dq_smooth.setChecked(bool(dq.get('smooth', True)))
             self.dq_window.setValue(int(dq.get('smooth_window') or 0))
             self.dq_order.setValue(int(dq.get('smooth_polyorder', 3)))

@@ -378,7 +378,9 @@ def derivative_curves(channel: Any, cycles: list[int], direction: str = "both", 
     Settings errors raise immediately. A data-specific failure is returned as an
     error curve (empty arrays) so other successful curves remain available.
     """
-    settings = _derivative_settings(n_points, smooth, smooth_window, smooth_polyorder, peak_prominence_pct, peak_min_distance)
+    automatic_grid = n_points == 0
+    settings = _derivative_settings(20000 if automatic_grid else n_points, smooth, smooth_window,
+                                    smooth_polyorder, peak_prominence_pct, peak_min_distance)
     if upper_voltage_v is not None and not _positive_number(upper_voltage_v):
         raise ValueError("상한전압은 양의 유한값이어야 합니다.")
     if peak_min_distance_mv is not None and not _positive_number(peak_min_distance_mv):
@@ -388,13 +390,15 @@ def derivative_curves(channel: Any, cycles: list[int], direction: str = "both", 
         raise ValueError("미분 방향은 charge/discharge/both 중 하나여야 합니다.")
     directions = ["charge", "discharge"] if kind in {"both", "all"} else [kind]
     frame = _filter_step(_selected_cycle_frame(channel, cycles, include_review, _CURVE_COLUMNS), step)
+    grouped = frame.groupby(['Cycle', 'TypeStd'], observed=True, sort=False).indices
     output = []
     for cycle in cycles:
         if cancel and cancel():
             raise InterruptedError("미분 분석 취소")
         for mode in directions:
             candidates = []
-            for segment in _step_segments(frame.loc[(frame["Cycle"] == cycle) & (frame["TypeStd"] == _DIRECTIONS[mode])]):
+            positions = grouped.get((cycle, _DIRECTIONS[mode]), [])
+            for segment in _step_segments(frame.iloc[positions]):
                 # Capacity resets must not become an artificial interpolated curve.
                 q = pd.to_numeric(segment["Capacity_mAh"], errors="coerce").to_numpy(dtype=float)
                 cuts = np.r_[0, np.flatnonzero(np.diff(q) < -max(1e-6, np.nanmax(np.abs(q)) * 1e-6)) + 1, len(segment)]
@@ -419,13 +423,19 @@ def derivative_curves(channel: Any, cycles: list[int], direction: str = "both", 
                     vv, qq = _cc_region_only(vv, qq, upper_voltage_v)
                 if len(np.unique(vv)) < 5 or len(np.unique(qq)) < 5 or np.ptp(qq) <= 0:
                     raise ValueError("미분에 필요한 서로 다른 전압/용량 값이 부족합니다.")
+                intervals = min(19_999, max(1, int(np.ceil(np.ptp(vv) * 1000)))) if automatic_grid else None
+                points = min(20_000, max(5, intervals + 1)) if automatic_grid else n_points
+                window = (max(11, (points // 25) | 1) if smooth_window is None else smooth_window)
+                if automatic_grid and smooth_window is not None and smooth_window >= points:
+                    raise ValueError('스무딩 윈도가 자동 보간점 수보다 작아야 합니다.')
+                options.update(n_points=points, smooth_window=window, voltage_spacing_mv=1000 * np.ptp(vv) / (points - 1))
                 effective_distance = peak_min_distance
                 if peak_min_distance_mv is not None:
-                    effective_distance = max(1, int(np.ceil(peak_min_distance_mv / 1000 / (np.ptp(vv) / (n_points - 1)))))
-                result = compute_dqdv(selected, int(cycle), mode, n_points=int(n_points), smooth=smooth,
-                                      smooth_window=int(settings["smooth_window"]), smooth_polyorder=smooth_polyorder,
+                    effective_distance = max(1, int(np.ceil(peak_min_distance_mv / 1000 / (np.ptp(vv) / (points - 1)))))
+                result = compute_dqdv(selected, int(cycle), mode, n_points=points, smooth=smooth,
+                                      smooth_window=window, smooth_polyorder=smooth_polyorder,
                                       peak_prominence_pct=peak_prominence_pct, peak_min_distance=effective_distance,
-                                      upper_voltage_v=upper_voltage_v)
+                                      upper_voltage_v=upper_voltage_v, compact_intervals=intervals)
                 if result is None:
                     raise ValueError("CV 제외 후 유효한 미분 구간이 부족합니다.")
                 if not np.isfinite(result["dqdv"]).all() or not np.isfinite(result["dvdq"]).all():
