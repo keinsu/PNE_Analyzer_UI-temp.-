@@ -22,7 +22,7 @@ jobs:
           architecture: x64
       - name: Install pinned build dependencies
         run: python -m pip install -r requirements.txt pyinstaller-hooks-contrib==2026.0 psutil==7.2.2
-      - name: Run tests, build one EXE, and check the packaged app
+      - name: Verify the automatic grid, build one EXE, and check the packaged app
         shell: cmd
         run: call build_onefile.bat
       - name: Publish verified Windows EXE
@@ -36,3 +36,4 @@ jobs:
           $hash = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()
           gh release create v3.1.4 $asset --repo keinsu/PNE_Analyzer_UI-temp.- --target $env:GITHUB_SHA --title "Battery Analysis Studio v3.1.4" --notes "Windows x64 single-file build. SHA-256: $hash"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
