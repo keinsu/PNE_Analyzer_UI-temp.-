@@ -44,10 +44,10 @@ def _json_value(value: Any):
         return {str(k): _json_value(v) for k, v in value.items()}
     if isinstance(value, (list, tuple, set)):
         return [_json_value(v) for v in value]
-    if hasattr(value, "item"):
-        return _json_value(value.item())
     if hasattr(value, "tolist"):
         return _json_value(value.tolist())
+    if hasattr(value, "item"):
+        return _json_value(value.item())
     raise TypeError(f"프로젝트에 저장할 수 없는 값: {type(value).__name__}")
 
 
@@ -61,6 +61,7 @@ def save_project(path: str, channels: list, ui_state: dict) -> dict:
         sources.append(dict(id=channel.id, name=channel.name, source_path=str(channel.source_path),
                             sha256=metadata.get("sha256", metadata.get("source_sha256", metadata.get("fingerprint"))),
                             metadata=_json_value(metadata), warnings=list(channel.warnings or [])))
+    _save_compact_sources(destination, channels, sources)
     from . import APP_VERSION
     payload = dict(schema_version=SCHEMA_VERSION, application="Battery Analysis Studio", version=APP_VERSION,
                    saved_utc=datetime.now(timezone.utc).isoformat(), sources=sources, ui_state=_json_value(ui_state))
@@ -95,3 +96,49 @@ def load_project(path: str) -> dict:
             raise ValueError("프로젝트 원본 경로/식별 정보가 올바르지 않습니다.")
     payload["project_path"] = str(source)
     return payload
+
+
+def _save_compact_sources(destination, channels, sources):
+    from shutil import copytree
+    from .compact_data import CompactStore
+    if not channels or not all(isinstance(channel.frame, CompactStore) for channel in channels):
+        return
+    parent = destination.with_name(destination.name + ".data")
+    parent.mkdir(exist_ok=True)
+    for channel, entry in zip(channels, sources):
+        target = parent / channel.frame.path.name
+        if not target.is_dir():
+            staging = parent / ("pending-" + uuid.uuid4().hex)
+            try:
+                copytree(channel.frame.path, staging)
+                try:
+                    staging.rename(target)
+                except OSError:
+                    if not target.is_dir():
+                        raise
+            finally:
+                from shutil import rmtree
+                rmtree(staging, ignore_errors=True)
+        entry["curve_store"] = target.relative_to(destination.parent).as_posix()
+
+
+def project_channels(project):
+    """Return prepared channels directly, or None for a source-based project."""
+    from .compact_data import CompactStore
+    from .ingestion import _cache_read
+    from .models import ChannelData
+    parent = Path(project["project_path"]).parent
+    entries = project["sources"]
+    if not entries or not all(entry.get("curve_store") for entry in entries):
+        return None
+    result = []
+    for entry in entries:
+        path = (parent / entry["curve_store"]).resolve()
+        if not path.is_relative_to(parent):
+            raise ValueError("프로젝트 데이터 저장 경로가 잘못되었습니다.")
+        cached = _cache_read(path, "channel")
+        if cached is None:
+            raise ValueError(f"{entry['name']}: 프로젝트 축소 데이터 폴더를 찾을 수 없습니다. .basproj 파일과 .data 폴더를 함께 보관하세요.")
+        result.append(ChannelData(entry["id"], entry["name"], entry["source_path"],
+                                  CompactStore(path), cached[1], entry["metadata"], entry.get("warnings", [])))
+    return result

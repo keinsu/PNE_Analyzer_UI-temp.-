@@ -415,6 +415,23 @@ def _stable_pulse_current_mA(t: np.ndarray, current_mA: np.ndarray, step_mode: s
     return stable_current, tail_spread <= tolerance
 
 
+def _stored_pulse_result(stored, times):
+    result = dict(stored)
+    for key in ("r_by_t", "v_by_t", "applied_current_by_t", "delta_current_by_t"):
+        values = {float(t): value for t, value in stored[key].items()}
+        result[key] = {t: values[t] if values.get(t) is not None else np.nan for t in times}
+    statuses = {float(t): value for t, value in stored["time_status"].items()}
+    result["time_status"] = {t: statuses.get(t, "저장된 측정 시점 없음") for t in times}
+    for key in ("v0", "i0_mA", "mean_current_mA", "rest_current_mA"):
+        if result.get(key) is None:
+            result[key] = np.nan
+    available = [(t, v, result["applied_current_by_t"][t]) for t, v in result["v_by_t"].items()
+                 if np.isfinite(v)]
+    points = np.asarray(available, dtype=float).reshape(-1, 3)
+    result["raw_time_s"], result["raw_voltage_v"], result["raw_current_mA"] = points.T
+    return result
+
+
 def compute_pulse_result(df: pd.DataFrame, segments: list, pulse_ref: dict, time_points_s: list, ordered=None) -> dict:
     """한 펄스의 시점별 DCIR과 원자료를 계산한다.
 
@@ -425,6 +442,8 @@ def compute_pulse_result(df: pd.DataFrame, segments: list, pulse_ref: dict, time
     이로써 0.0초의 0 A 전환값이나 초반 전류 상승값이 ``ΔI``를 작게 만들어 DCIR을 과대
     계산하는 문제를 막는다. CP는 각 시간시점의 전류를 사용한다.
     """
+    if "fixed_dcr" in pulse_ref:
+        return _stored_pulse_result(pulse_ref["fixed_dcr"], time_points_s)
     seg = segments[pulse_ref["seg"]]
     rest_seg = segments[pulse_ref["rest_seg"]] if pulse_ref.get("rest_seg") is not None else None
     ordered = df.sort_values("_row", kind="stable") if ordered is None else ordered

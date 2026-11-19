@@ -25,7 +25,8 @@ from .widgets import CurvePlot, DataTable, PALETTE, cycle_color, display_value
 from .ingestion import load_inputs
 from .analysis import apply_cycle_baseline, prepare_cycle_tables, raw_curves, track_peaks
 from .derivative_cache import cached_derivatives
-from .project import save_project, load_project, default_output_dir
+from .project import save_project, load_project, project_channels, default_output_dir
+from .compact_data import CompactStore, prepare_channel
 from .dcr_panel import DCRPanel
 from .raw_store import PREVIEW_POINTS
 from .study_ui import StudyWorkspace
@@ -835,8 +836,11 @@ class StudioWindow(QMainWindow):
         settings.pop('peak_track_shift_mv')
 
         def load(progress, cancel):
-            channels = load_inputs(paths, progress=progress, cancel=cancel, cache_dir=cache_dir,
-                                   csv_options=csv_options, disk_backed=True)
+            def prepare(channel):
+                progress(0, 1, f'곡선·요약·DCR 준비 · {channel.name}')
+                return prepare_channel(channel, cache_dir, cancel)
+            channels = load_inputs(paths, progress=progress, cancel=cancel,
+                                   csv_options=csv_options, consume=prepare)
             if channels and channels[0].cycles:
                 first = channels[0]
                 progress(0, 1, f'기본 미분 곡선 준비 · {first.name}')
@@ -1164,6 +1168,7 @@ class StudioWindow(QMainWindow):
                 merged = merge_same_cell([by_id[c['id']] for c in components],
                     [int(c['offset']) for c in components], source.get('name', '연결 시험'))
                 if merged.id not in by_id:
+                    merged = self._prepare_merge(merged, [by_id[c['id']] for c in components], [int(c['offset']) for c in components])
                     self.channels.append(merged)
                     by_id[merged.id] = merged
 
@@ -1256,6 +1261,15 @@ class StudioWindow(QMainWindow):
             return
         try:
             project = load_project(path)
+            prepared = project_channels(project)
+            if prepared is not None:
+                self.study_workspace.leave()
+                self._pending_project = None
+                self._project_path = path
+                self.show_study_channels(prepared, project.get('ui_state', {}))
+                self.merge_button.show()
+                self.study_details_button.hide()
+                return
             sources = project.get('sources', [])
             paths = []
             for source in sources:
@@ -1469,6 +1483,14 @@ class StudioWindow(QMainWindow):
             return path
         self._start('export', export, lambda p: self.statusBar().showMessage(f'Excel 저장 완료 · {p}'))
 
+    @staticmethod
+    def _prepare_merge(merged, channels, offsets, cancel=None):
+        if all(isinstance(channel.frame, CompactStore) for channel in channels):
+            from tempfile import gettempdir
+            return prepare_channel(merged, Path(gettempdir()) / 'BatteryAnalysisStudio3' / 'cache',
+                                   cancel, components=list(zip(channels, offsets)))
+        return merged
+
     def merge_channels(self):
         channels = self.selected_channels()
         if len(channels) < 2:
@@ -1498,10 +1520,14 @@ class StudioWindow(QMainWindow):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             try:
                 from .analysis import merge_same_cell
-                merged = merge_same_cell(channels, [s.value() for s in offsets])
-                self.channels.append(merged)
-                self._populate_tree()
-                self.refresh_current()
+                values = [s.value() for s in offsets]
+                def work(progress, cancel):
+                    return self._prepare_merge(merge_same_cell(channels, values), channels, values, cancel)
+                def ready(merged):
+                    self.channels.append(merged)
+                    self._populate_tree()
+                    self.refresh_current()
+                self._start('analysis', work, ready)
             except Exception as exc:
                 self.show_error(str(exc))
 

@@ -23,7 +23,7 @@ _CYCLE_COLUMNS = ("Cycle", "Voltage_V", "Capacity_mAh", "TypeStd", "_row", "Matc
                   "Current_mA", "Energy_mWh", "Temp_C")
 _AGGREGATIONS = ("representative", "step_sum")
 _CURVE_COLUMNS = ("Cycle", "Voltage_V", "Capacity_mAh", "TypeStd", "_row", "MatchStatus",
-                  "StepTime_s", "PhysicalStepID", "Source_File", "StepNo", "Current_mA")
+                  "StepTime_s", "PhysicalStepID", "Source_File", "StepNo", "Current_mA", "_compact_curve")
 
 
 def analysis_frame(channel: Any, include_review: bool = False, *, frame=None, columns=None) -> pd.DataFrame:
@@ -74,6 +74,8 @@ def _step_segments(frame: pd.DataFrame) -> list[pd.DataFrame]:
         # Estimate gaps inside each already identified physical segment only.
         cuts = np.r_[np.flatnonzero(boundary), len(d)]
         for a, b in zip(cuts[:-1], cuts[1:]):
+            if "_compact_curve" in d and d["_compact_curve"].iloc[a:b].eq(True).all():
+                continue
             dt = np.diff(t[a:b])
             valid = dt[np.isfinite(dt) & (dt > 0)]
             if len(valid) >= 3:
@@ -310,7 +312,7 @@ def raw_curves(channel: Any, cycles: list[int], x: str = "StepTime_s", y: str = 
         mode = str(segment["TypeStd"].iloc[0]).lower()
         curves.append(dict(x=xv, y=yv, name=f"{channel.name} · C{cycle} · Step {label} · {mode}",
                            cycle=cycle, direction=mode, step=label, source_id=channel.id, channel=channel.name,
-                           raw_indices=segment["_row"].to_numpy(dtype=int), point_kind="measured",
+                           raw_indices=segment["_row"].to_numpy(dtype=int), point_kind="interpolated" if "_compact_curve" in segment and segment["_compact_curve"].eq(True).all() else "measured",
                            x_column=x, y_column=y, settings={"include_review": include_review}))
         if display_budget and len(xv) > display_budget and good.all():
             previews_needed[len(curves) - 1] = curves[-1]["raw_indices"]
@@ -543,8 +545,8 @@ def merge_same_cell(channels: list, offsets: list[int], name: str = "연결 시�
         d["MergedComponent_ID"] = channel.id
         d["CycleOffset"] = int(offset)
         d["Cycle"] = shifted.astype(int)
-        d["_row"] = np.arange(row_cursor, row_cursor + len(d), dtype=int)
-        row_cursor += len(d)
+        d["_row"] = row_cursor + d["_row"].to_numpy(dtype=int) - int(d["_row"].iloc[0])
+        row_cursor = int(d["_row"].iloc[-1]) + 2
         if "PhysicalStepID" in d:
             d["PhysicalStepID"] = channel.id + ":" + d["PhysicalStepID"].astype(str)
         if "TotalTime_s" in d:

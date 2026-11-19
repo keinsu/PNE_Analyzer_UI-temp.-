@@ -265,6 +265,16 @@ class DCRPanel(QWidget):
             self.review.socSettingStepsInp.setText(str(settings.get("setting_steps", "")))
             self.review.timePointsInp.setText(str(settings.get("time_points_text", "1,10,30")))
             self.review.socOcvInp.setText(str(settings.get("soc_ocv_text", "")))
+            channel = self.channels.get(self.active_id)
+            fixed = channel is not None and hasattr(channel.frame, "dcr")
+            for widget in (self.review.pulseMaxDurationSpin, self.review.cutoffTolSpin,
+                           self.review.socSettingStepsInp, self.review.timePointsInp):
+                widget.setEnabled(not fixed)
+            if fixed:
+                self.review.pulseMaxDurationSpin.setValue(90)
+                self.review.cutoffTolSpin.setValue(10)
+                self.review.socSettingStepsInp.clear()
+                self.review.timePointsInp.setText("0.1,0.5,1,10,30,60")
         finally:
             self._applying = False
 
@@ -384,6 +394,8 @@ class DCRPanel(QWidget):
         include_review = self.include_review
 
         def work(cancel):
+            if hasattr(channel.frame, "dcr"):
+                return pd.DataFrame({"_row": []}), channel.frame.dcr(include_review)
             from .analysis import analysis_frame
             frame = analysis_frame(channel, include_review=include_review,
                                    columns=('Cycle', '_row', 'Voltage_V', 'Capacity_mAh', 'Current_mA',
@@ -568,8 +580,12 @@ class DCRPanel(QWidget):
         self.previewHover.reattach()
         self.currentPreview.clear()
         t = values["raw_time_s"]
-        self.preview.plot(t, values["raw_voltage_v"], pen=pg.mkPen("#39bdb3", width=1.5), name="Raw 전압")
-        self.currentPreview.plot(t, values["raw_current_mA"], pen=pg.mkPen("#f4b942", width=1.5), name="Raw 전류")
+        channel = self.channels.get(self.active_id)
+        fixed = channel is not None and hasattr(channel.frame, "dcr")
+        self.preview.plot(t, values["raw_voltage_v"], pen=pg.mkPen("#39bdb3", width=1.5),
+                          name="저장 전압" if fixed else "Raw 전압")
+        self.currentPreview.plot(t, values["raw_current_mA"], pen=pg.mkPen("#f4b942", width=1.5),
+                                 name="저장 전류" if fixed else "Raw 전류")
         v0 = values.get("v0", np.nan)
         if np.isfinite(v0):
             self.preview.addItem(pg.InfiniteLine(v0, angle=0, pen=pg.mkPen("#e49c82", style=Qt.PenStyle.DashLine)))
@@ -578,7 +594,7 @@ class DCRPanel(QWidget):
             self.preview.plot([point[0] for point in points], [point[1] for point in points],
                               pen=None, symbol="o", symbolSize=8, symbolBrush="#e69d83", name="DCR 시점")
         source = {"pulse_t0": "Pulse 0초", "previous_rest": "직전 Rest", "first_valid_pulse_sample": "첫 유효 Pulse 대체"}.get(values.get("v0_source"), "미지정")
-        self.previewLabel.setText(f"원본 Pulse · V0={v0:.6g} V ({source}) · 휴지전류={values.get('rest_current_mA', 0):.6g} mA · {values.get('control_mode', '')}")
+        self.previewLabel.setText(f"{'저장된 DCR 시점' if fixed else '원본 Pulse'} · V0={v0:.6g} V ({source}) · 휴지전류={values.get('rest_current_mA', 0):.6g} mA · {values.get('control_mode', '')}")
 
     def _output_path(self, filename, file_filter):
         try:

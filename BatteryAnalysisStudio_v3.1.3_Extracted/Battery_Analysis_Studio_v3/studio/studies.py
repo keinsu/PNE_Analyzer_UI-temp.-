@@ -193,17 +193,9 @@ class Study:
         return candidate, messages, changed
 
     def _store(self, channel, cancel):
-        frame = channel.frame
-        if isinstance(frame, RawStore) and frame.path.parent.resolve() == self.cache_dir.resolve():
-            return frame.path.relative_to(self.directory).as_posix()
-        path = self.cache_dir / (channel.fingerprint + "-study-v1")
-        try:
-            RawStore(path)
-        except (OSError, ValueError, KeyError):
-            RawStore.write(path, channel.read_rows(), cancel, build_previews=False)
-        from .ingestion import _cache_write
-        _cache_write(path, "channel", (pd.DataFrame(), channel.steps, {}, []), cancel)
-        return path.relative_to(self.directory).as_posix()
+        from .compact_data import prepare_channel
+        stored = prepare_channel(channel, self.cache_dir, cancel)
+        return stored.frame.path.relative_to(self.directory).as_posix()
 
     def preview_cycles(self, selections, cancel):
         """Build an all-or-nothing revision. Selections include explicit cell/segment IDs."""
@@ -243,7 +235,7 @@ class Study:
             overlaps = sorted(incoming & occupied)
             if overlaps:
                 raise ValueError(f"{cell['name']}: 누적 Cycle 겹침 {', '.join(map(str, overlaps[:12]))}")
-            if old and old.get("parse_fingerprint") == channel.fingerprint:
+            if old and old["store"].endswith("-compact-v1") and old.get("parse_fingerprint") == channel.fingerprint:
                 messages.append(f"{cell['name']}: 변경 없음")
                 continue
             signatures, changed, revisions, extended = {}, [], [], []
@@ -263,7 +255,7 @@ class Study:
                 messages.append(f"{cell['name']}: 마지막 Cycle 기록이 짧은 파일입니다. 기존 구간 유지")
                 continue
             if not changed and old:
-                if (old["source"], old["channel"]) == (channel.source_path, channel.name):
+                if old["store"].endswith("-compact-v1") and (old["source"], old["channel"]) == (channel.source_path, channel.name):
                     messages.append(f"{cell['name']}: 변경 없음")
                     continue
                 messages.append(f"{cell['name']}: 측정값 동일, 원본 위치 정보 갱신")
@@ -288,7 +280,8 @@ class Study:
                 raise ValueError(f"{channel.name}: 정량분석에 사용할 확인된 Cycle이 없습니다.")
             path = self._store(channel, cancel)
             end = max(incoming)
-            last_row = channel.read_rows([slice(channel.row_count - 1, channel.row_count)], ["_row"])
+            stored = RawStore(self.directory / path)
+            last_row = stored.read([slice(stored.size - 1, stored.size)], ["_row"])
             record = dict(id=segment_id or uuid.uuid4().hex, start=start, end=end,
                           source_start=cycles[0], offset=offset, channel=channel.name,
                           source=channel.source_path, member=channel.metadata.get("source_member", ""),
@@ -329,7 +322,7 @@ class Study:
             if not cell["segments"]:
                 continue
             fingerprint = hashlib.sha256(json.dumps(
-                [(s["id"], s["digest"], s["offset"]) for s in cell["segments"]]).encode()).hexdigest()
+                [(s["id"], s["digest"], s["offset"], s["store"]) for s in cell["segments"]]).encode()).hexdigest()
             metadata = dict(input_type="study_cell", parse_fingerprint=fingerprint,
                             status_counts={"CSV": 1, "REVIEW": 1})
             channels.append(ChannelData(cell["id"], cell["name"], str(self.path), store,
@@ -351,7 +344,8 @@ class StudyCellStore:
                 path = (directory / segment["store"]).resolve()
                 if not path.is_relative_to(directory):
                     raise ValueError("잘못된 저장 경로")
-                raw = RawStore(path)
+                from .compact_data import CompactStore
+                raw = CompactStore(path) if path.name.endswith('-compact-v1') else RawStore(path)
             except (OSError, KeyError, ValueError, TypeError):
                 self.warnings.append(f"{segment['start']}–{segment['end']} Cycle의 상세 데이터 저장소를 찾을 수 없습니다.")
                 continue
@@ -380,6 +374,18 @@ class StudyCellStore:
             result[mode] = (pd.concat(frames, ignore_index=True).sort_values("Cycle", kind="stable")
                             if frames else pd.DataFrame())
         return result
+
+    def dcr(self, review):
+        from .compact_data import CompactStore, _dcr_snapshot, merge_dcr
+        sources = []
+        for _, _, raw, segment in self.parts:
+            if isinstance(raw, CompactStore):
+                detection = raw.dcr(review)
+            else:
+                source = ChannelData(segment["id"], segment["channel"], segment["source"], raw)
+                detection = _dcr_snapshot(source, review, None)
+            sources.append((detection, segment["offset"], segment["id"]))
+        return merge_dcr(sources)
 
     def step_table(self):
         from .ingestion import _cache_read

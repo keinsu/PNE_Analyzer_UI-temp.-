@@ -627,7 +627,7 @@ def _cache_write(cache_dir, key, result, cancel=None):
 
 
 def load_inputs(paths: list[str], progress=None, cancel=None, cache_dir=None,
-                csv_options=None, *, disk_backed=False, build_previews=True) -> list[ChannelData]:
+                csv_options=None, *, disk_backed=False, build_previews=True, consume=None) -> list[ChannelData]:
     """Load inputs, returning one ChannelData per independent channel/file.
 
     Partial failures are returned in warnings/metadata of successful channels;
@@ -756,7 +756,9 @@ def load_inputs(paths: list[str], progress=None, cancel=None, cache_dir=None,
             if metadata["input_type"] == "CSV":
                 name = PurePosixPath(source.name).stem
             identity = hashlib.sha256((source.reference + "\0" + digest).encode("utf-8")).hexdigest()[:24]
-            channels.append(ChannelData(identity, name, source.container, frame, steps, metadata, warnings))
+            channel = ChannelData(identity, name, source.container, frame, steps, metadata, warnings)
+            channels.append(consume(channel) if consume else channel)
+            del channel
             del data, step_data, result, frame
         except InterruptedError:
             raise

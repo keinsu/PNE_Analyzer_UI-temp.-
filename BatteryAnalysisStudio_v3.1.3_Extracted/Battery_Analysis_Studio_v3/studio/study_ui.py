@@ -137,8 +137,7 @@ class StudyWorkspace:
                              lambda result: self._confirm(study, result))
         else:
             self.host._start("study", lambda progress, cancel: load_inputs(paths, progress, cancel,
-                             cache_dir=study.cache_dir, csv_options=csv_options,
-                             disk_backed=True, build_previews=False),
+                             csv_options=csv_options),
                              lambda channels: self._map(study, channels, target))
 
     def _map(self, study, channels, target):
