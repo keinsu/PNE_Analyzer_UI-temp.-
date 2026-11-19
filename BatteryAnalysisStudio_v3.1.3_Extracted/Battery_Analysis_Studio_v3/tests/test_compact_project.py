@@ -56,7 +56,8 @@ class CompactProjectTests(unittest.TestCase):
 
     def test_original_pulse_is_sampled_at_import(self):
         frame = pulse_fixture()
-        frame = frame[~((frame["StepNo"] == "2") & (frame["StepTime_s"] == .1))]
+        frame = frame[~((frame["StepNo"] == "2") & (frame["StepTime_s"] == .1))].copy()
+        frame["_row"] = np.arange(len(frame))
         channel = ChannelData("a", "pulse", "source", frame)
         detection = _dcr_snapshot(channel, False, None)
         pulse = detection["blocks"][0]["pulse_groups"][0]["pulses"][0]

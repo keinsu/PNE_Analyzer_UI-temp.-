@@ -22,7 +22,7 @@ jobs:
           architecture: x64
       - name: Install pinned build dependencies
         run: python -m pip install -r requirements.txt pyinstaller-hooks-contrib==2026.0 psutil==7.2.2
-      - name: Verify project reopen and stored pulse samples, then build the EXE
+      - name: Verify compact project and DCR tests before packaging
         shell: cmd
         run: call build_onefile.bat
       - name: Publish verified Windows EXE
