@@ -1,0 +1,16 @@
+{
+  "status": "ok",
+  "version": "3.1.3",
+  "frozen": true,
+  "qt": "6.11.1",
+  "channels": 3,
+  "raw_points": 462,
+  "disk_backed": true,
+  "summary_cycles": 5,
+  "dqdv_points": 500,
+  "dcr_pulses": 4,
+  "project_roundtrip": true,
+  "study_roundtrip": true,
+  "origin_export_bridge": true,
+  "validation": "synthetic data only; actual PNE instrument data not validated"
+}
