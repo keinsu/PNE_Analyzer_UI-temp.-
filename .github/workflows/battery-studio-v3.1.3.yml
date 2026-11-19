@@ -1,0 +1,57 @@
+name: Build Battery Analysis Studio v3.1.3
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/battery-studio-v3.1.3.yml]
+permissions:
+  contents: write
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: BatteryAnalysisStudio_v3.1.3_Extracted/Battery_Analysis_Studio_v3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: a8ae8868e0dd7e7c6e4795434a17f55def8629fa
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.5'
+          architecture: x64
+      - name: Verify source manifest
+        shell: bash
+        run: |
+          python - <<'PY'
+          from hashlib import sha256
+          import json
+          from pathlib import Path
+          manifest = json.loads(Path('docs/source_manifest.json').read_text(encoding='utf-8'))
+          assert manifest['version'] == '3.1.3'
+          for name, expected in manifest['files_sha256'].items():
+              path = Path(name)
+              if name == '.gitignore' and not path.exists():
+                  continue
+              data = path.read_bytes()
+              candidates = (data, data.replace(b'\r\n', b'\n'), data.replace(b'\r\n', b'\n').replace(b'\n', b'\r\n'))
+              if not any(sha256(item).hexdigest() == expected for item in candidates):
+                  raise SystemExit(f'Source checksum mismatch: {name}')
+          PY
+      - name: Install pinned build dependencies
+        run: python -m pip install -r requirements.txt pyinstaller-hooks-contrib==2026.0
+      - name: Run tests, build one EXE, and check the packaged app
+        shell: cmd
+        run: call build_onefile.bat
+      - name: Publish verified Windows EXE
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $asset = 'BatteryAnalysisStudio_v3.1.3_OneFile.exe'
+          Copy-Item 'dist_onefile/BatteryAnalysisStudio_v3_OneFile.exe' $asset
+          $hash = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+          gh release create v3.1.3 $asset --repo keinsu/PNE_Analyzer_UI-temp.- --target a8ae8868e0dd7e7c6e4795434a17f55def8629fa --title "Battery Analysis Studio v3.1.3" --notes "Windows x64 single-file build. SHA-256: $hash"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
