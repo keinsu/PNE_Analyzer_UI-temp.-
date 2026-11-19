@@ -134,7 +134,11 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(self.window.dq_plot.list.count(), 2)
         self.assertEqual(self.window.dq_plot.list.item(0).foreground().color(),
                          self.window.raw.graph.list.item(0).foreground().color())
-        self.assertTrue(all(len(c["x"]) == 500 for c in self.window.dq_plot.curves))
+        for curve in self.window.dq_plot.curves:
+            grid = curve["x"]
+            expected = max(5, int(np.ceil((grid[-1] - grid[0]) * 1000)) + 1)
+            self.assertEqual(len(grid), expected)
+            self.assertLessEqual(float(np.max(np.diff(grid))), 0.001000001)
         self.assertEqual(len(self.window.channels), 1)
 
     def test_import_defers_raw_tables_and_dcr_until_opened(self):
