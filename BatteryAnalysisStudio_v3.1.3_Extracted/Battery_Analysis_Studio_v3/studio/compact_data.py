@@ -133,6 +133,11 @@ class CompactStore(RawStore):
             table.attrs.update(cached[2].get(name, {}))
         return tables
 
+    def rpt_rows(self):
+        from .ingestion import _cache_read
+        cached = _cache_read(self.path, "channel")
+        return cached[2].get("rpt_rows", []) if cached else []
+
     def dcr(self, review):
         from .ingestion import _cache_read
         cached = _cache_read(self.path, "channel")
@@ -143,6 +148,7 @@ class CompactStore(RawStore):
 
 def prepare_channel(channel, root, cancel=None, *, components=()):
     from .ingestion import _cache_read, _cache_write
+    from .import_rules import rpt_rows
     root = Path(root)
     if isinstance(channel.frame, CompactStore):
         return channel
@@ -157,12 +163,20 @@ def prepare_channel(channel, root, cancel=None, *, components=()):
     from shutil import rmtree
     try:
         fixed_dcr = {}
+        kind = channel.metadata.get("import_kind", "cycle")
+        extracted = rpt_rows(channel, channel.metadata["import_rules"]["rpt"], cancel) if kind == "rpt" else []
         for review in (False, True):
             label = str(int(review))
             has_review = bool(channel.metadata.get("status_counts", {}).get("REVIEW"))
-            if not review or has_review or components:
+            if kind == "other":
+                fixed_dcr[label] = {"segments": [], "blocks": []}
+                tables = {"representative": pd.DataFrame(), "step_sum": pd.DataFrame()}
+            elif not review or has_review or components:
                 fixed_dcr[label] = merge_dcr([(part.frame.dcr(review), offset, part.id) for part, offset in components]) if components else _dcr_snapshot(channel, review, cancel)
-                tables = _merge_tables(components, review) if components else cycle_aggregates(channel, review, cancel=cancel, allow_empty=True)
+                if kind == "rpt":
+                    tables = {"representative": pd.DataFrame(), "step_sum": pd.DataFrame()}
+                else:
+                    tables = _merge_tables(components, review) if components else cycle_aggregates(channel, review, cancel=cancel, allow_empty=True)
             else:
                 fixed_dcr[label] = fixed_dcr["0"]
             _cache_write(staged, f"summary-{label}", (tables["representative"], tables["step_sum"],
@@ -178,7 +192,7 @@ def prepare_channel(channel, root, cancel=None, *, components=()):
         metadata = dict(channel.metadata, compact_curves=True, disk_backed=True, original_rows=channel.row_count,
                         parse_fingerprint=channel.fingerprint + '-compact-v1')
         _cache_write(data, "channel", (pd.DataFrame(), channel.steps,
-                                     {"metadata": metadata, "fixed_dcr": fixed_dcr}, channel.warnings), cancel)
+                                     {"metadata": metadata, "fixed_dcr": fixed_dcr, "rpt_rows": extracted}, channel.warnings), cancel)
         if _cache_read(data, "channel") is None:
             raise OSError("축소 프로젝트 정보를 저장할 수 없습니다.")
         try:

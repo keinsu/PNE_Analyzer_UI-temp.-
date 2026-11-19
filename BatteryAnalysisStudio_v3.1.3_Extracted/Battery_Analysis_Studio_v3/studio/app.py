@@ -27,6 +27,7 @@ from .analysis import apply_cycle_baseline, prepare_cycle_tables, raw_curves, tr
 from .derivative_cache import cached_derivatives
 from .project import save_project, load_project, project_channels, default_output_dir
 from .compact_data import CompactStore, prepare_channel
+from .import_dialog import classify_channels
 from .dcr_panel import DCRPanel
 from .raw_store import PREVIEW_POINTS
 from .study_ui import StudyWorkspace
@@ -150,6 +151,7 @@ class StudioWindow(QMainWindow):
             ('프로젝트 열기…', 'Ctrl+Shift+O', self.open_project),
             ('프로젝트 저장…', 'Ctrl+S', self.save_current_project),
             ('분석 프리셋 저장…', '', self.save_preset), ('분석 프리셋 불러오기…', '', self.open_preset),
+            ('RPT 결과 보기…', '', self.show_rpt_results),
             ('분석 Excel 저장…', 'Ctrl+E', self.export_excel),
         ]:
             action = QAction(title, self)
@@ -563,7 +565,9 @@ class StudioWindow(QMainWindow):
                 self.tree.addTopLevelItem(parent)
                 parent.setExpanded(True)
                 groups[source] = parent
-            child = QTreeWidgetItem([c.name])
+            kind = c.metadata.get("import_kind", "cycle")
+            title = f"{c.name} · {'RPT' if kind == 'rpt' else '기타'}" if kind != "cycle" else c.name
+            child = QTreeWidgetItem([title])
             child.setData(0, Qt.ItemDataRole.UserRole, c.id)
             child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             counts = c.metadata.get('status_counts', {})
@@ -730,7 +734,7 @@ class StudioWindow(QMainWindow):
         paths, _ = QFileDialog.getOpenFileNames(self, 'PNE ZIP 또는 Raw CSV 추가', '',
             '배터리 데이터 (*.zip *.csv *.cyc);;모든 파일 (*)')
         if paths:
-            self.import_paths(paths)
+            self.import_paths(paths, configure=True)
 
     def add_folder(self):
         path = QFileDialog.getExistingDirectory(self, '시험 또는 채널 폴더 선택')
@@ -738,7 +742,7 @@ class StudioWindow(QMainWindow):
             if self.study_workspace.study:
                 self.study_workspace.add([path], cycle_only=True)
             else:
-                self.import_paths([path])
+                self.import_paths([path], configure=True)
 
     def add_mapped_csv(self):
         path, _ = QFileDialog.getOpenFileName(self, '컬럼·단위를 지정할 CSV', '', 'CSV/TSV (*.csv *.tsv);;모든 파일 (*)')
@@ -750,7 +754,7 @@ class StudioWindow(QMainWindow):
             if self.study_workspace.study:
                 self.study_workspace.add([path], cycle_only=True, csv_options=dialog.options())
             else:
-                self.import_paths([path], csv_options=dialog.options())
+                self.import_paths([path], csv_options=dialog.options(), configure=True)
 
     def show_study_channels(self, channels, state):
         self._invalidate_analysis()
@@ -781,7 +785,7 @@ class StudioWindow(QMainWindow):
         self.render_summaries()
         self.restore_state(state)
 
-    def import_paths(self, paths, replace=False, csv_options=None):
+    def import_paths(self, paths, replace=False, csv_options=None, *, configure=False):
         self._selection_timer.stop()
         self._invalidate_analysis()
         if self.dcr._busy:
@@ -835,12 +839,13 @@ class StudioWindow(QMainWindow):
         settings = self.derivative_settings()
         settings.pop('peak_track_shift_mv')
 
-        def load(progress, cancel):
+        def load(progress, cancel, configured=None):
             def prepare(channel):
                 progress(0, 1, f'곡선·요약·DCR 준비 · {channel.name}')
                 return prepare_channel(channel, cache_dir, cancel)
-            channels = load_inputs(paths, progress=progress, cancel=cancel,
-                                   csv_options=csv_options, consume=prepare)
+            channels = (load_inputs(paths, progress=progress, cancel=cancel,
+                                    csv_options=csv_options, consume=prepare) if configured is None
+                        else [prepare(channel) for channel in configured])
             if channels and channels[0].cycles:
                 first = channels[0]
                 progress(0, 1, f'기본 미분 곡선 준비 · {first.name}')
@@ -851,7 +856,15 @@ class StudioWindow(QMainWindow):
                     pass
             return channels
 
-        self._start('load', load, loaded)
+        if configure:
+            def rules_ready(channels):
+                configured = classify_channels(self, channels)
+                if configured is not None:
+                    self._start('load', lambda progress, cancel: load(progress, cancel, configured), loaded)
+            self._start('load', lambda progress, cancel: load_inputs(
+                paths, progress=progress, cancel=cancel, csv_options=csv_options), rules_ready)
+        else:
+            self._start('load', load, loaded)
 
     def refresh_current(self):
         if not self.channels:
@@ -894,7 +907,7 @@ class StudioWindow(QMainWindow):
         except ValueError as exc:
             self.show_error(str(exc))
             return
-        channels = self.selected_channels()
+        channels = [c for c in self.selected_channels() if c.metadata.get("import_kind", "cycle") == "cycle"]
         review, aggregation = self.include_review.isChecked(), self.aggregate.currentData()
         keys = [(channel, self._cycle_table_key(channel, review)) for channel in channels]
         pending = [(channel, key) for channel, key in keys if key not in self._summary_cache]
@@ -1088,7 +1101,8 @@ class StudioWindow(QMainWindow):
         except ValueError as exc:
             self.show_error(str(exc))
             return
-        channels, settings = self.selected_channels(), self.derivative_settings()
+        channels = [c for c in self.selected_channels() if c.metadata.get("import_kind") != "other"]
+        settings = self.derivative_settings()
         settings.pop('peak_track_shift_mv')
         key = (tuple((c.id, c.fingerprint) for c in channels), tuple(cycles), tuple(settings.items()))
         def calculate(progress, cancel):
@@ -1359,6 +1373,38 @@ class StudioWindow(QMainWindow):
             frame.to_csv(path, index=False, encoding='utf-8-sig')
             self.statusBar().showMessage(f'저장 완료 · {path}')
 
+    def show_rpt_results(self):
+        channels = [c for c in self.channels if c.metadata.get("import_kind") == "rpt"]
+        if not channels:
+            self.show_error('RPT로 분류한 파일을 먼저 가져오세요.')
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle('저장된 RPT 결과')
+        dialog.resize(950, 520)
+        layout = QVBoxLayout(dialog)
+        selector = QComboBox()
+        for channel in channels:
+            selector.addItem(f'{channel.name} · {Path(channel.source_path).name}')
+        layout.addWidget(selector)
+        table = DataTable()
+        layout.addWidget(table)
+        def display(index):
+            table.set_frame(pd.DataFrame(channels[index].frame.rpt_rows()))
+        selector.currentIndexChanged.connect(display)
+        display(0)
+        button = QPushButton('결과 CSV 저장')
+        def export():
+            path, _ = QFileDialog.getSaveFileName(dialog, 'RPT 결과 저장',
+                str(Path(default_output_dir()) / 'RPT.csv'), 'CSV (*.csv)')
+            if path:
+                try:
+                    table.model.frame.to_csv(path, index=False, encoding='utf-8-sig')
+                except OSError as exc:
+                    self.show_error(str(exc))
+        button.clicked.connect(export)
+        layout.addWidget(button)
+        dialog.exec()
+
     def export_raw(self):
         channel = self.active_channel()
         if channel is None:
@@ -1493,6 +1539,9 @@ class StudioWindow(QMainWindow):
 
     def merge_channels(self):
         channels = self.selected_channels()
+        if any(c.metadata.get("import_kind", "cycle") != "cycle" for c in channels):
+            self.show_error('Cycle로 분류한 채널만 연결할 수 있습니다.')
+            return
         if len(channels) < 2:
             self.show_error('같은 셀의 분할시험 채널을 두 개 이상 선택하세요.')
             return
@@ -1541,7 +1590,7 @@ class StudioWindow(QMainWindow):
             if self.study_workspace.study:
                 self.study_workspace.add(paths, cycle_only=any(Path(p).is_dir() for p in paths))
             else:
-                self.import_paths(paths)
+                self.import_paths(paths, configure=True)
 
     def closeEvent(self, event):
         active_threads = [t for t in self._threads if t.isRunning()]

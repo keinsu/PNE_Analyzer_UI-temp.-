@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QFileDialog
 
 from .ingestion import load_inputs
 from .studies import Study, _now
+from .import_dialog import classify_channels
 
 
 def _button(layout, name, action):
@@ -121,26 +122,34 @@ class StudyWorkspace:
         if not self.study or not self._available():
             return
         study = self.study
-        kind = "수명시험(CYC)"
-        if target is None and not cycle_only:
-            kind, ok = QInputDialog.getItem(self.host, "데이터 유형", "등록할 데이터",
-                                            [kind, "RPT"], 0, False)
-            if not ok:
-                return
         if not paths:
             paths, _ = QFileDialog.getOpenFileNames(self.host, "시험 데이터 선택", "",
                                                    "배터리 데이터 (*.zip *.csv *.tsv *.cyc);;모든 파일 (*)")
         if not paths:
             return
-        if kind == "RPT":
-            self.host._start("study", lambda progress, cancel: study.preview_rpt(paths, cancel),
-                             lambda result: self._confirm(study, result))
-        else:
-            self.host._start("study", lambda progress, cancel: load_inputs(paths, progress, cancel,
-                             csv_options=csv_options),
-                             lambda channels: self._map(study, channels, target))
+        def ready(channels):
+            initial = None
+            if target:
+                cell = next(c for c in study.data["cells"] if c["id"] == target[0])
+                initial = next((s.get("import_rules") for s in cell["segments"] if s["id"] == target[1]), None)
+            configured = classify_channels(self.host, channels, cycle_only=target is not None, initial=initial)
+            if configured is None:
+                return
+            cycle = [c for c in configured if c.metadata["import_kind"] == "cycle"]
+            auxiliary = [c for c in configured if c.metadata["import_kind"] != "cycle"]
+            if cycle:
+                self._map(study, cycle, target, auxiliary)
+            else:
+                self._prepare_import(study, [], auxiliary)
 
-    def _map(self, study, channels, target):
+        self.host._start("study", lambda progress, cancel: load_inputs(
+            paths, progress, cancel, csv_options=csv_options), ready)
+
+    def _prepare_import(self, study, selection, auxiliary):
+        self.host._start("study", lambda progress, cancel: study.preview_cycles(selection, cancel, auxiliary),
+                         lambda result: self._confirm(study, result))
+
+    def _map(self, study, channels, target, auxiliary=()):
         dialog = QDialog(self.host)
         dialog.setWindowTitle("원본 채널을 셀에 연결")
         dialog.resize(1000, 510)
@@ -206,9 +215,8 @@ class StudyWorkspace:
 
         buttons.accepted.connect(accept)
         buttons.rejected.connect(dialog.reject)
-        if dialog.exec() == QDialog.DialogCode.Accepted and selection:
-            self.host._start("study", lambda progress, cancel: study.preview_cycles(selection, cancel),
-                             lambda result: self._confirm(study, result))
+        if dialog.exec() == QDialog.DialogCode.Accepted and (selection or auxiliary):
+            self._prepare_import(study, selection, auxiliary)
 
     def _confirm(self, study, result):
         candidate, messages, changed = result
@@ -225,8 +233,9 @@ class StudyWorkspace:
         dialog.setDefaultButton(QMessageBox.StandardButton.No if changed else QMessageBox.StandardButton.Ok)
         if changed and dialog.exec() == QMessageBox.StandardButton.Yes:
             state = self.host.ui_state()
-            existing_ids = {cell["id"] for cell in study.data["cells"]}
-            state["selected_channels"].extend(c["id"] for c in candidate["cells"] if c["id"] not in existing_ids)
+            existing_ids = {row.get("id") for row in study.data["cells"] + study.data["rpt"]}
+            state["selected_channels"].extend(row["id"] for row in candidate["cells"] + candidate["rpt"]
+                                               if row.get("id") not in existing_ids and row.get("id"))
             candidate["settings"] = state
             study.commit(candidate)
             self._display(state)
@@ -250,9 +259,10 @@ class StudyWorkspace:
                 row.setData(Qt.ItemDataRole.UserRole, (cell["id"], segment["id"]))
                 items.addItem(row)
         for rpt in study.data["rpt"]:
-            row = QListWidgetItem("RPT  ·  " + rpt["name"])
+            label = "기타" if rpt.get("kind") == "other" else "RPT"
+            row = QListWidgetItem(label + "  ·  " + rpt["name"])
             row.setToolTip(rpt["path"])
-            row.setData(Qt.ItemDataRole.UserRole, ("rpt", rpt["sha256"]))
+            row.setData(Qt.ItemDataRole.UserRole, ("rpt", rpt.get("id", rpt["sha256"])))
             items.addItem(row)
         bar = QHBoxLayout()
         layout.addLayout(bar)
@@ -271,7 +281,7 @@ class StudyWorkspace:
             cell_id, segment_id = item.data(Qt.ItemDataRole.UserRole)
             candidate = deepcopy(study.data)
             if cell_id == "rpt":
-                candidate["rpt"] = [rpt for rpt in candidate["rpt"] if rpt["sha256"] != segment_id]
+                candidate["rpt"] = [rpt for rpt in candidate["rpt"] if rpt.get("id", rpt["sha256"]) != segment_id]
             else:
                 for cell in candidate["cells"]:
                     if cell["id"] == cell_id:

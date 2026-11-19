@@ -197,7 +197,7 @@ class Study:
         stored = prepare_channel(channel, self.cache_dir, cancel)
         return stored.frame.path.relative_to(self.directory).as_posix()
 
-    def preview_cycles(self, selections, cancel):
+    def preview_cycles(self, selections, cancel, auxiliary=()):
         """Build an all-or-nothing revision. Selections include explicit cell/segment IDs."""
         candidate = deepcopy(self.data)
         messages = []
@@ -254,6 +254,10 @@ class Study:
                     signatures[str(old_last)]["rows"] < old["signatures"][str(old_last)]["rows"]):
                 messages.append(f"{cell['name']}: 마지막 Cycle 기록이 짧은 파일입니다. 기존 구간 유지")
                 continue
+            rules = channel.metadata.get("import_rules")
+            if old and old.get("import_rules") != rules:
+                changed = list(cycles)
+                messages.append(f"{cell['name']}: 용량 Step 지정 갱신")
             if not changed and old:
                 if old["store"].endswith("-compact-v1") and (old["source"], old["channel"]) == (channel.source_path, channel.name):
                     messages.append(f"{cell['name']}: 변경 없음")
@@ -286,7 +290,7 @@ class Study:
                           source_start=cycles[0], offset=offset, channel=channel.name,
                           source=channel.source_path, member=channel.metadata.get("source_member", ""),
                           digest=channel.metadata.get("sha256"), parse_fingerprint=channel.fingerprint, store=path,
-                          signatures=signatures, tables=tables, at=_now(),
+                          signatures=signatures, tables=tables, import_rules=rules, at=_now(),
                           row_span=int(last_row["_row"].iloc[0]) + 1)
             if old:
                 cell["segments"][cell["segments"].index(old)] = record
@@ -313,6 +317,23 @@ class Study:
             gaps = [f"{a+1}–{b-1}" for a, b in zip(combined, combined[1:]) if b > a + 1]
             if gaps:
                 messages.append("누락 Cycle: " + ", ".join(gaps[:12]))
+        for channel in auxiliary:
+            if cancel():
+                raise InterruptedError("파일 등록 취소")
+            kind = channel.metadata["import_kind"]
+            source_id = channel.id
+            old = next((record for record in candidate["rpt"] if record.get("id") == source_id), None)
+            if old and old.get("fingerprint") == channel.fingerprint:
+                messages.append(f"{channel.name}: 변경 없음")
+                continue
+            record = dict(id=source_id, name=channel.name, path=channel.source_path,
+                          sha256=channel.metadata["sha256"], fingerprint=channel.fingerprint,
+                          kind=kind, store=self._store(channel, cancel), at=_now())
+            if old:
+                candidate["rpt"][candidate["rpt"].index(old)] = record
+            else:
+                candidate["rpt"].append(record)
+            messages.append(f"{channel.name}: {'RPT' if kind == 'rpt' else '기타'} 기록 저장")
         return self._preview(candidate, messages)
 
     def channels(self):
@@ -327,6 +348,21 @@ class Study:
                             status_counts={"CSV": 1, "REVIEW": 1})
             channels.append(ChannelData(cell["id"], cell["name"], str(self.path), store,
                                         store.step_table(), metadata, store.warnings))
+        from .compact_data import CompactStore
+        from .ingestion import _cache_read
+        for record in self.data["rpt"]:
+            if "store" not in record:
+                continue
+            path = (self.directory / record["store"]).resolve()
+            if not path.is_relative_to(self.directory):
+                continue
+            try:
+                cached = _cache_read(path, "channel")
+                if cached:
+                    channels.append(ChannelData(record["id"], record["name"], record["path"],
+                                                CompactStore(path), cached[1], cached[2]["metadata"], cached[3]))
+            except (OSError, ValueError, KeyError):
+                continue
         return channels
 
 

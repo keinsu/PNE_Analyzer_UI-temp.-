@@ -153,13 +153,20 @@ def cycle_aggregates(channel, include_review=False, *, modes=_AGGREGATIONS, canc
     frame = analysis_frame(channel, include_review, frame=selected, columns=_CYCLE_COLUMNS)
     if frame.empty and not allow_empty:
         raise ValueError("계산에 사용할 확인된 데이터가 없습니다. 매칭 검토 상태를 확인하세요.")
+    capacity_rules = getattr(channel, "metadata", {}).get("import_rules", {}).get("capacity", {})
     rows = {mode: [] for mode in modes}
     warnings = {mode: [] for mode in modes}
     for cycle, subset in frame.groupby("Cycle", sort=True, observed=True):
         if cancel and cancel():
             raise InterruptedError("Cycle 집계 취소")
         segments = _step_segments(subset)
-        chosen = [_representative(segments, k) for k in ("CHARGE", "DISCHARGE")]
+        directions = ("CHARGE", "DISCHARGE")
+        explicit = {kind: set(capacity_rules.get(kind, [])) for kind in directions}
+        matching = {kind: [s for s in segments if str(s["TypeStd"].iloc[0]) == kind
+                           and (not explicit[kind] or ("StepNo" in s and str(s["StepNo"].iloc[0]) in explicit[kind]))]
+                    for kind in directions}
+        chosen = [_representative(matching[kind], kind) for kind in directions]
+        combined = [s for kind in directions for s in matching[kind]]
         rest = subset.loc[~subset["TypeStd"].isin(["CHARGE", "DISCHARGE"])]
         selected = pd.concat([rest] + [s for s in chosen if s is not None]).sort_values("_row")
         counts = {k: sum(str(s["TypeStd"].iloc[0]) == k for s in segments) for k in ("CHARGE", "DISCHARGE")}
@@ -170,17 +177,26 @@ def cycle_aggregates(channel, include_review=False, *, modes=_AGGREGATIONS, canc
         details = dict(Source_ID=channel.id, Source_File=channel.name,
                    OriginalCycle=subset["OriginalCycle"].iloc[0] if "OriginalCycle" in subset else cycle,
                    Charge_Step_Count=counts["CHARGE"], Discharge_Step_Count=counts["DISCHARGE"],
-                   Charge_Step=_step_label(chosen[0]) if chosen[0] is not None else "",
-                   Discharge_Step=_step_label(chosen[1]) if chosen[1] is not None else "",
+                   Charge_Step=", ".join(_step_label(s) for s in matching["CHARGE"]) if explicit["CHARGE"]
+                               else (_step_label(chosen[0]) if chosen[0] is not None else ""),
+                   Discharge_Step=", ".join(_step_label(s) for s in matching["DISCHARGE"]) if explicit["DISCHARGE"]
+                                  else (_step_label(chosen[1]) if chosen[1] is not None else ""),
                    Included_Rows=len(subset), Review_Rows=int((subset["MatchStatus"] == "REVIEW").sum()) if "MatchStatus" in subset else 0)
         for mode in modes:
             row = representative.copy()
             message = []
             if any(count > 1 for count in counts.values()):
                 message.append("복수 물리 Step: " + ("방향별 최대 용량 Step 사용" if mode == "representative" else "각 Step 증분 합계 사용"))
-            if mode == "step_sum" and "AnalysisError" not in row:
+            for kind in directions:
+                if explicit[kind] and not matching[kind]:
+                    message.append(f"{kind} 지정 Step 없음: {', '.join(sorted(explicit[kind]))}")
+            if (mode == "step_sum" or any(explicit.values())) and "AnalysisError" not in row:
                 try:
-                    _sum_step_metrics(row, segments)
+                    selected_segments = combined if mode == "step_sum" else [
+                        seg for kind, representative_step in zip(directions, chosen)
+                        for seg in (matching[kind] if explicit[kind] else
+                                    [representative_step] if representative_step is not None else [])]
+                    _sum_step_metrics(row, selected_segments)
                 except Exception as exc:
                     row = {"Cycle": int(cycle), "AnalysisError": str(exc)}
             if row.get("AnalysisError"):
