@@ -22,7 +22,7 @@ jobs:
           architecture: x64
       - name: Install pinned build dependencies
         run: python -m pip install -r requirements.txt pyinstaller-hooks-contrib==2026.0 psutil==7.2.2
-      - name: Verify channel emphasis and Cycle numbering before packaging
+      - name: Verify graph emphasis and numbering across summary views
         shell: cmd
         run: call build_onefile.bat
       - name: Publish verified Windows EXE

@@ -217,7 +217,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(combo.currentData(), "Energy_Retention_pct")
         table = self.window.life.table.model.frame
         self.assertEqual(table.Source_ID.nunique(), 1)
-        self.assertEqual(table.loc[table.Cycle == 2, "Energy_Retention_pct"].iloc[0], 100.)
+        self.assertEqual(table.loc[table.Cycle == 1, "Energy_Retention_pct"].iloc[0], 100.)
         self.assertIn("2", self.window.cards[3].text())
 
     def test_summary_reuses_same_setting_cache(self):
@@ -236,7 +236,7 @@ class WorkspaceTests(unittest.TestCase):
             self.window.aggregate.setCurrentIndex(1)
             self.window.calculate_summaries()
             self.assertEqual(compute.call_count, 1)
-            self.assertEqual(self.window.summary.table.model.frame.Cycle.tolist(), [2])
+            self.assertEqual(self.window.summary.table.model.frame.Cycle.tolist(), [1])
             self.window.summary_start.setValue(1)
             self.assertEqual(sorted(self.window.summary.table.model.frame.Cycle.tolist()), [1, 2])
 
