@@ -352,7 +352,7 @@ class StudioWindow(QMainWindow):
         self.baseline.setPlaceholderText('자동 · 2부터 첫 유효 Cycle')
         self.baseline.returnPressed.connect(self.refresh_current)
         self.baseline.textChanged.connect(self._summary_dirty)
-        form.addRow('유지율 기준 Cycle', self.baseline)
+        form.addRow('유지율 기준 (변경 전 Cycle)', self.baseline)
         self.aggregate = QComboBox()
         self.aggregate.addItem('대표값 (기존 Qt 기준)', 'representative')
         self.aggregate.addItem('물리 Step 용량 합계', 'step_sum')
@@ -380,7 +380,7 @@ class StudioWindow(QMainWindow):
                 self.summary_start.setRange(0, 10000000)
                 self.summary_start.setValue(2)
                 self.summary_start.valueChanged.connect(self.render_summaries)
-                form.addRow('표시 시작 Cycle', self.summary_start)
+                form.addRow('시작 Cycle (새 1)', self.summary_start)
             self._pages[index] = self.settings_stack.addWidget(widget)
         raw_settings = QWidget()
         form = QFormLayout(raw_settings)
@@ -958,6 +958,14 @@ class StudioWindow(QMainWindow):
         self._start('analysis', calculate, ready)
         self._summary_pending = (self._tokens['analysis'], requested)
 
+    def _display_cycles(self, frame):
+        if frame is None or frame.empty:
+            return frame
+        start = self.summary_start.value()
+        visible = frame.loc[frame['Cycle'] >= start].copy()
+        visible['Cycle'] = visible['Cycle'] - start + 1
+        return visible
+
     def render_summaries(self, *_):
         for index, page in [(0, self.summary), (1, self.life), (5, self.compare)]:
             if index not in self.metric_widgets:
@@ -966,13 +974,9 @@ class StudioWindow(QMainWindow):
             metric = combo.currentData()
             curves, frames = [], []
             for channel in self.selected_channels():
-                frame = self._summaries.get(channel.id)
+                frame = self._display_cycles(self._summaries.get(channel.id))
                 if frame is None or frame.empty:
                     continue
-                if index == 0:
-                    frame = frame.loc[frame['Cycle'] >= self.summary_start.value()]
-                    if frame.empty:
-                        continue
                 enriched = frame.copy()
                 enriched.insert(0, 'Channel', channel.name)
                 enriched['Source_ID'] = channel.id
@@ -1004,7 +1008,7 @@ class StudioWindow(QMainWindow):
         if not hasattr(self, 'cards'):
             return
         channel = self.active_channel()
-        summary = self._summaries.get(channel.id) if channel else None
+        summary = self._display_cycles(self._summaries.get(channel.id)) if channel else None
         values = ['—'] * 4
         if summary is not None and not summary.empty:
             row = summary.iloc[-1]
@@ -1356,7 +1360,7 @@ class StudioWindow(QMainWindow):
         frames = []
         for channel in self.selected_channels():
             if channel.id in self._summaries:
-                frames.append(self._summaries[channel.id].assign(Channel=channel.name, Source_ID=channel.id))
+                frames.append(self._display_cycles(self._summaries[channel.id]).assign(Channel=channel.name, Source_ID=channel.id))
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
     def export_current_table(self):

@@ -193,7 +193,11 @@ class WorkspaceTests(unittest.TestCase):
         with patch("studio.study_ui.QMessageBox.exec", return_value=QMessageBox.StandardButton.Yes):
             manager._confirm(study, preview)
         self.idle()
-        self.assertEqual(self.window.summary.graph.curves[0]["x"].tolist(), [101, 102])
+        self.window.summary_start.setValue(101)
+        self.assertEqual(self.window.summary.graph.curves[0]["x"].tolist(), [1, 2])
+        self.window.summary_start.setValue(102)
+        self.assertEqual(self.window.summary.graph.curves[0]["x"].tolist(), [1])
+        self.assertEqual(self.window.life.table.model.frame["Cycle"].tolist(), [1])
         self.assertEqual(self.window.selected_channels()[0].name, "Cell-01")
         self.assertTrue(self.window.merge_button.isHidden())
         self.window.baseline.setText("102")
@@ -327,6 +331,21 @@ class WorkspaceTests(unittest.TestCase):
         graph.list.item(0).setCheckState(Qt.CheckState.Unchecked)
         np.testing.assert_array_equal(graph.curves[0]["x"], original)
         graph.close()
+        graph.deleteLater()
+
+    def test_multiple_curve_emphasis_can_be_cleared(self):
+        graph = CurvePlot()
+        graph.set_curves([dict(x=[0., 1.], y=[i, i + 1.], name=str(i)) for i in range(3)])
+        graph.list.item(0).setSelected(True)
+        graph._toggle_curve_emphasis(1)
+        for item, width, opacity in zip(graph.items, [1.2, 1.2, 1.], [1., 1., .32]):
+            self.assertAlmostEqual(item.opts["pen"].widthF(), CURVE_WIDTH * width)
+            self.assertAlmostEqual(item.opacity(), opacity)
+        state = graph.graph_state()
+        graph.clear_emphasis.click()
+        self.assertEqual([item.opacity() for item in graph.items], [1., 1., 1.])
+        graph.restore_graph_state(state)
+        self.assertEqual([item.opacity() for item in graph.items], [1., 1., .32])
         graph.deleteLater()
 
     def test_graph_uses_high_contrast_palette_and_thicker_lines(self):

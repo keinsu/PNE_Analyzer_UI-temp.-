@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import pyqtgraph as pg
 import pyqtgraph.exporters
-from PySide6.QtCore import Qt, Signal, QAbstractTableModel, QModelIndex, QSortFilterProxyModel, QTimer
+from PySide6.QtCore import Qt, Signal, QAbstractTableModel, QModelIndex, QSortFilterProxyModel, QTimer, QItemSelectionModel
 from PySide6.QtGui import QColor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit,
@@ -150,7 +150,7 @@ class CurvePlot(QWidget):
         super().__init__(parent)
         self.curves = []
         self.items = []
-        self.selected = -1
+        self._emphasized = set()
         self._legend_groups = []
         self._curve_to_legend = []
         self._history = []
@@ -168,6 +168,9 @@ class CurvePlot(QWidget):
             button = QPushButton(label)
             button.clicked.connect(callback)
             toolbar.addWidget(button)
+        self.clear_emphasis = QPushButton('강조 해제')
+        self.clear_emphasis.setEnabled(False)
+        toolbar.addWidget(self.clear_emphasis)
         toolbar.addStretch()
         self.png_btn = QPushButton('PNG 저장')
         self.csv_btn = QPushButton('곡선 CSV')
@@ -211,7 +214,9 @@ class CurvePlot(QWidget):
         self.list.setMinimumWidth(140)
         self.list.setMaximumWidth(260)
         self.list.itemChanged.connect(self._visibility)
-        self.list.currentRowChanged.connect(self.highlight)
+        self.list.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        self.list.itemSelectionChanged.connect(self._update_emphasis)
+        self.clear_emphasis.clicked.connect(self.list.clearSelection)
         legend = QWidget()
         legend_layout = QVBoxLayout(legend)
         legend_layout.setContentsMargins(0, 0, 0, 0)
@@ -240,6 +245,7 @@ class CurvePlot(QWidget):
         self.marker = pg.ScatterPlotItem(size=9, brush='#ffffff', pen=pg.mkPen('#45d8c0', width=2))
         for item in (self.vline, self.hline, self.marker):
             self.plot.addItem(item, ignoreBounds=True)
+            item.setZValue(10)
             item.hide()
 
     def set_labels(self, x, y):
@@ -249,7 +255,7 @@ class CurvePlot(QWidget):
     def set_curves(self, curves, *, group_cycles=False):
         self.curves = [c for c in curves if len(c.get('x', [])) and len(c.get('x', [])) == len(c.get('y', []))]
         self.items = []
-        self.selected = -1
+        self._emphasized = set()
         self._legend_groups = []
         self._curve_to_legend = []
         groups = {}
@@ -270,6 +276,8 @@ class CurvePlot(QWidget):
             if curve['_x_sorted']:
                 item.setDownsampling(auto=True, method='peak')
                 item.setClipToView(True)
+            item.setCurveClickable(True, width=8)
+            item.sigClicked.connect(lambda *_, index=i: self._toggle_curve_emphasis(index))
             self.items.append(item)
             key = (curve.get('source_id'), curve['cycle']) if group_cycles else i
             legend_index = groups.get(key)
@@ -293,6 +301,7 @@ class CurvePlot(QWidget):
             row.setForeground(QColor(color))
             self.list.addItem(row)
         self.list.blockSignals(False)
+        self._update_emphasis()
         self.legend_search.setVisible(group_cycles and bool(groups))
         self._filter_legend(self.legend_search.text() if group_cycles else '')
         self.set_stale(False)
@@ -310,10 +319,15 @@ class CurvePlot(QWidget):
         for i, (curve, item) in enumerate(zip(self.curves, self.items)):
             color = curve.get('color', PALETTE[i % len(PALETTE)])
             style = Qt.PenStyle.DashLine if curve.get('direction') in ('discharge', 'DISCHARGE') else Qt.PenStyle.SolidLine
-            item.setPen(pg.mkPen(color, width=CURVE_WIDTH, style=style))
+            emphasized = i in self._emphasized
+            item.setPen(pg.mkPen(color, width=CURVE_WIDTH * (1.2 if emphasized else 1), style=style))
+            item.setOpacity(1.0 if emphasized or not self._emphasized else 0.32)
+            item.setZValue(1 if emphasized else 0)
+        previous = self.list.blockSignals(True)
         for row, group in enumerate(self._legend_groups):
             curve = self.curves[group[0]]
             self.list.item(row).setForeground(QColor(curve.get('color', PALETTE[group[0] % len(PALETTE)])))
+        self.list.blockSignals(previous)
 
     def _queue_resolution(self, *_):
         if any('plot_indices' in curve for curve in self.curves):
@@ -404,6 +418,7 @@ class CurvePlot(QWidget):
             for i in self._legend_groups[row]:
                 self.items[i].setVisible(visible)
         self._update_origin_button()
+        self._update_emphasis()
 
     def checked_curves(self):
         return [curve for i, curve in enumerate(self.curves)
@@ -414,18 +429,26 @@ class CurvePlot(QWidget):
             self.list.item(row).checkState() == Qt.CheckState.Checked
             for row in range(self.list.count())))
 
-    def highlight(self, row):
-        self.selected = row
-        selected = set(self._legend_groups[row]) if 0 <= row < len(self._legend_groups) else set()
-        for i, item in enumerate(self.items):
-            item.setOpacity(1. if not selected or i in selected else .32)
-        if selected:
-            self.curveSelected.emit(self.curves[self._legend_groups[row][0]])
+    def _toggle_curve_emphasis(self, index):
+        legend_item = self.list.item(self._curve_to_legend[index])
+        legend_item.setSelected(not legend_item.isSelected())
+
+    def _update_emphasis(self):
+        previous = self._emphasized
+        self._emphasized = {i for row in self.list.selectedItems()
+                            if row.checkState() == Qt.CheckState.Checked
+                            for i in self._legend_groups[self.list.row(row)]}
+        self.clear_emphasis.setEnabled(bool(self.list.selectedItems()))
+        self.update_colors()
+        added = self._emphasized - previous
+        if added:
+            self.curveSelected.emit(self.curves[min(added)])
 
     def highlight_cycle(self, cycle):
         for i, curve in enumerate(self.curves):
             if curve.get('cycle') == cycle:
-                self.list.setCurrentRow(self._curve_to_legend[i])
+                self.list.setCurrentRow(self._curve_to_legend[i],
+                                        QItemSelectionModel.SelectionFlag.ClearAndSelect)
                 break
 
     def _hover(self, event):
@@ -437,7 +460,7 @@ class CurvePlot(QWidget):
         ranges = view.viewRange()
         sx = max(1e-12, ranges[0][1] - ranges[0][0])
         sy = max(1e-12, ranges[1][1] - ranges[1][0])
-        candidates = self._legend_groups[self.selected] if 0 <= self.selected < len(self._legend_groups) else range(len(self.curves))
+        candidates = sorted(self._emphasized) if self._emphasized else range(len(self.curves))
         best = None
         for i in candidates:
             if not self.items[i].isVisible():
@@ -478,22 +501,24 @@ class CurvePlot(QWidget):
         self.readout.setText(f"{curve.get('name', '')}  ·  {kind}  ·  X {x0:.8g}  ·  Y {y0:.8g}  ·  점 {k + 1:,}")
 
     def graph_state(self):
-        selected = self._legend_groups[self.selected][0] if 0 <= self.selected < len(self._legend_groups) else None
+        selected = [self.curves[self._legend_groups[self.list.row(row)][0]].get('name')
+                    for row in self.list.selectedItems()]
         return {'range': self.plot.viewRange(), 'hidden': [c.get('name') for i, c in enumerate(self.curves)
                 if self.list.item(self._curve_to_legend[i]).checkState() != Qt.CheckState.Checked],
-                'selected': self.curves[selected].get('name') if selected is not None else None}
+                'selected': selected}
 
     def restore_graph_state(self, state):
         ranges = state.get('range')
         if ranges and len(ranges) == 2:
             self.plot.setRange(xRange=ranges[0], yRange=ranges[1], padding=0)
         hidden = set(state.get('hidden', []))
+        selected = state.get('selected')
+        emphasized = set(selected if isinstance(selected, list) else [selected])
         for row, group in enumerate(self._legend_groups):
             names = {self.curves[i].get('name') for i in group}
             if names <= hidden:
                 self.list.item(row).setCheckState(Qt.CheckState.Unchecked)
-            if state.get('selected') in names:
-                self.list.setCurrentRow(row)
+            self.list.item(row).setSelected(bool(emphasized.intersection(names)))
 
     def export_png(self):
         from .project import default_output_dir
