@@ -132,7 +132,7 @@ class StudyWorkspace:
             if target:
                 cell = next(c for c in study.data["cells"] if c["id"] == target[0])
                 initial = next((s.get("import_rules") for s in cell["segments"] if s["id"] == target[1]), None)
-            configured = classify_channels(self.host, channels, cycle_only=target is not None, initial=initial)
+            configured = classify_channels(self.host, channels, cycle_only=target is not None, initial=initial, paths=paths)
             if configured is None:
                 return
             cycle = [c for c in configured if c.metadata["import_kind"] == "cycle"]

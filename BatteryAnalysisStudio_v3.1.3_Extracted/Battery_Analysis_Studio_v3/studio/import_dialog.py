@@ -1,15 +1,13 @@
-"""Select per-file import rules and reuse saved RPT items or presets."""
+"""Select one import rule per channel group and reuse saved RPT items or presets."""
 import json
 from pathlib import Path
 
 from PySide6.QtCore import QSettings
-from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog, QDialogButtonBox,
-    QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMessageBox, QPushButton, QStackedWidget, QVBoxLayout, QWidget)
-from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
+    QMessageBox, QPushButton, QScrollArea, QStackedWidget, QVBoxLayout, QWidget)
 
-from .analysis import cycle_aggregates
-from .import_rules import FIELDS, KINDS, OPERATIONS, apply_rules, rpt_rows, step_options
+from .import_rules import FIELDS, KINDS, OPERATIONS, apply_rules, step_options
 
 
 def _library():
@@ -24,16 +22,18 @@ def _library():
 class RuleDialog(QDialog):
     def __init__(self, parent, channels, cycle_only=False, initial=None):
         super().__init__(parent)
-        self.channels = channels
         self.setWindowTitle("가져오기 · 파일 분류 및 Step 지정")
         self.resize(760, 650)
         self.settings, self.library = _library()
         self.items = []
-        self.options = [entry for channel in channels for entry in step_options(channel)]
+        self.options = step_options(channels[0])
         self.steps = list(dict.fromkeys(step for step, *_ in self.options))
         layout = QVBoxLayout(self)
         first = channels[0]
-        layout.addWidget(QLabel(str(first.metadata.get("source_member") or Path(first.source_path).name)))
+        source = QLabel(f"첫 채널: {first.name}  ·  적용 대상: {len(channels):,}개 채널")
+        source.setWordWrap(True)
+        source.setToolTip(str(first.metadata.get("source_member") or first.source_path))
+        layout.addWidget(source)
         form = QFormLayout()
         layout.addLayout(form)
         self.kind = QComboBox()
@@ -43,22 +43,41 @@ class RuleDialog(QDialog):
         form.addRow("파일 분류", self.kind)
         self.step_list = QListWidget()
         self.step_list.setMaximumHeight(125)
+        self.step_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.step_list.setStyleSheet('QListWidget { background: #202d39; color: #f2f6fa; border: 1px solid #71869a; }')
         for step, mode, cycles, rows in dict.fromkeys(self.options):
             self.step_list.addItem(f"Step {step} · {mode} · {cycles:,} Cycle · {rows:,}점")
-        form.addRow("추출된 Step", self.step_list)
+        form.addRow("첫 채널의 Step", self.step_list)
         self.pages = QStackedWidget()
         layout.addWidget(self.pages)
         cycle = QWidget()
         cycle_form = QFormLayout(cycle)
         self.capacity = {}
         for mode, label in [("CHARGE", "충전 용량"), ("DISCHARGE", "방전 용량")]:
-            picks = QListWidget()
-            picks.setMaximumHeight(105)
-            picks.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setMaximumHeight(110)
+            scroll.setStyleSheet("QScrollArea { border: 1px solid #71869a; border-radius: 4px; }")
+            panel = QWidget()
+            panel.setObjectName("capacityStepPanel")
+            panel.setStyleSheet("QWidget#capacityStepPanel { background: #202d39; }"
+                                "QCheckBox { background: #202d39; color: #f2f6fa; padding: 5px 10px; }"
+                                "QCheckBox:hover { background: #314961; }"
+                                "QCheckBox:checked { background: #254b6d; }")
+            options = QVBoxLayout(panel)
+            options.setContentsMargins(6, 4, 6, 4)
+            options.setSpacing(3)
+            checks = {}
             for step in dict.fromkeys(step for step, direction, *_ in self.options if direction == mode):
-                picks.addItem(step)
-            self.capacity[mode] = picks
-            cycle_form.addRow(label, picks)
+                checkbox = QCheckBox(f"Step {step}")
+                options.addWidget(checkbox)
+                checks[step] = checkbox
+            if not checks:
+                options.addWidget(QLabel("해당 방향의 Step 없음"))
+            options.addStretch()
+            self.capacity[mode] = checks
+            scroll.setWidget(panel)
+            cycle_form.addRow(label, scroll)
         cycle_form.addRow(QLabel("선택한 Step의 용량 증가분을 합산합니다. 선택하지 않은 방향은 기존 자동 규칙을 사용합니다."))
         self.pages.addWidget(cycle)
         rpt = QWidget()
@@ -92,7 +111,6 @@ class RuleDialog(QDialog):
         actions = QHBoxLayout()
         self._button(actions, "프리셋 불러오기", self.load_preset)
         self._button(actions, "프리셋 저장", self.save_preset)
-        self._button(actions, "계산 미리보기", self.preview)
         layout.addLayout(actions)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.confirm)
@@ -111,7 +129,7 @@ class RuleDialog(QDialog):
 
     def rules(self):
         return dict(kind=self.kind.currentData(),
-                    capacity={mode: [item.text() for item in picks.selectedItems()]
+                    capacity={mode: [step for step, checkbox in picks.items() if checkbox.isChecked()]
                               for mode, picks in self.capacity.items()},
                     rpt=list(self.items))
 
@@ -122,15 +140,15 @@ class RuleDialog(QDialog):
         missing = []
         for mode, picks in self.capacity.items():
             wanted = set(rules.get("capacity", {}).get(mode, []))
-            available = {picks.item(i).text() for i in range(picks.count())}
+            available = set(picks)
             missing.extend(sorted(wanted - available))
         if missing:
             raise ValueError("이 파일에 없는 용량 Step: " + ", ".join(missing))
         self.kind.setCurrentIndex(index)
         for mode, picks in self.capacity.items():
             wanted = set(rules.get("capacity", {}).get(mode, []))
-            for i in range(picks.count()):
-                picks.item(i).setSelected(picks.item(i).text() in wanted)
+            for step, checkbox in picks.items():
+                checkbox.setChecked(step in wanted)
         self.items = list(rules.get("rpt", []))
         self.show_items()
 
@@ -237,34 +255,22 @@ class RuleDialog(QDialog):
         if self.validate():
             self.accept()
 
-    def preview(self):
-        if not self.validate():
-            return
-        rules = self.rules()
-        rows = []
-        try:
-            for channel in self.channels:
-                if rules["kind"] == "cycle" and channel.cycles:
-                    prepared = apply_rules(channel, rules)
-                    for row in cycle_aggregates(prepared, cycles=[channel.cycles[0]], allow_empty=True)["representative"].to_dict("records"):
-                        rows.append(f"{channel.name} · Cycle {row['Cycle']} · 충전 {row.get('Charge_Capacity_mAh', float('nan')):.6g} / 방전 {row.get('Discharge_Capacity_mAh', float('nan')):.6g} mAh")
-                elif rules["kind"] == "rpt":
-                    for row in rpt_rows(channel, rules["rpt"])[:12]:
-                        rows.append(f"{channel.name} · {row['Item']} · Step {row['Step']} · {row['Value'] if row['Value'] is not None else row['Status']}")
-        except (TypeError, ValueError) as exc:
-            QMessageBox.warning(self, "미리보기", str(exc))
-            return
-        QMessageBox.information(self, "첫 결과 미리보기", "\n".join(rows[:15]) if rows else "집계할 항목이 없습니다.")
 
-
-def classify_channels(parent, channels, cycle_only=False, initial=None):
+def classify_channels(parent, channels, cycle_only=False, initial=None, *, paths=()):
+    roots = [Path(path).resolve() for path in paths if Path(path).is_dir()]
     groups = {}
     for channel in channels:
-        groups.setdefault((channel.source_path, channel.metadata.get("source_member", "")), []).append(channel)
+        path = Path(channel.source_path).resolve()
+        if path.suffix.lower() == ".zip":
+            group = path
+        else:
+            group = next((root for root in roots if path.is_relative_to(root)), path.parent)
+        groups.setdefault(group, []).append(channel)
     configured = []
     for group in groups.values():
         dialog = RuleDialog(parent, group, cycle_only, initial)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return None
-        configured.extend(apply_rules(channel, dialog.rules()) for channel in group)
+        rules = dialog.rules()
+        configured.extend(apply_rules(channel, rules) for channel in group)
     return configured

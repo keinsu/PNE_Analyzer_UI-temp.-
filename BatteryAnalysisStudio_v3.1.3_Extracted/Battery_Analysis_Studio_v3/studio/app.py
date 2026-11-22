@@ -858,7 +858,7 @@ class StudioWindow(QMainWindow):
 
         if configure:
             def rules_ready(channels):
-                configured = classify_channels(self, channels)
+                configured = classify_channels(self, channels, paths=paths)
                 if configured is not None:
                     self._start('load', lambda progress, cancel: load(progress, cancel, configured), loaded)
             self._start('load', lambda progress, cancel: load_inputs(
