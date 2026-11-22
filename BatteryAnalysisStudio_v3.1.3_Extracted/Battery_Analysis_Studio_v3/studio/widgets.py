@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import csv
-import colorsys
 import json
 import math
 from pathlib import Path
@@ -34,10 +33,14 @@ HEADERS = {'Channel': '채널', 'Cycle': 'Cycle', 'OriginalCycle': '원본 Cycle
     'StepTime_s': 'Step 시간 (s)', 'Warnings': '검토 사항', 'AnalysisError': '계산 오류'}
 
 
-def cycle_color(cycle: int) -> str:
-    hue = (.52 + (cycle - 1) * .61803398875) % 1
-    rgb = colorsys.hls_to_rgb(hue, .67 + .08 * ((cycle // 5) % 2), .9)
-    return '#%02x%02x%02x' % tuple(round(v * 255) for v in rgb)
+def cycle_gradient(cycles):
+    """Spread selected Cycles across cyan and coral in numerical order."""
+    order = sorted(set(cycles))
+    first, last = QColor('#00E5FF'), QColor('#FF769D')
+    start, end = np.array(first.getRgb()[:3]), np.array(last.getRgb()[:3])
+    return {cycle: QColor(*np.rint(start + (end - start) * index / max(1, len(order) - 1))
+                           .astype(int).tolist()).name()
+            for index, cycle in enumerate(order)}
 
 
 def display_value(value):
@@ -150,6 +153,7 @@ class CurvePlot(QWidget):
         super().__init__(parent)
         self.curves = []
         self.items = []
+        self.peak_items = []
         self._emphasized = set()
         self._legend_groups = []
         self._curve_to_legend = []
@@ -252,9 +256,10 @@ class CurvePlot(QWidget):
         self.plot.setLabel('bottom', x)
         self.plot.setLabel('left', y)
 
-    def set_curves(self, curves, *, group_cycles=False):
+    def set_curves(self, curves, *, group_cycles=False, show_peaks=False):
         self.curves = [c for c in curves if len(c.get('x', [])) and len(c.get('x', [])) == len(c.get('y', []))]
         self.items = []
+        self.peak_items = []
         self._emphasized = set()
         self._legend_groups = []
         self._curve_to_legend = []
@@ -279,6 +284,15 @@ class CurvePlot(QWidget):
             item.setCurveClickable(True, width=8)
             item.sigClicked.connect(lambda *_, index=i: self._toggle_curve_emphasis(index))
             self.items.append(item)
+            peaks = curve.get('peaks', []) if show_peaks else []
+            marker = None
+            if peaks:
+                marker = pg.ScatterPlotItem(x=[p['voltage'] for p in peaks],
+                                            y=[p['value'] for p in peaks],
+                                            symbol='o', size=9, pen=pg.mkPen('#eaf5fa', width=1.2))
+                marker.setZValue(3)
+                self.plot.addItem(marker, ignoreBounds=True)
+            self.peak_items.append(marker)
             key = (curve.get('source_id'), curve['cycle']) if group_cycles else i
             legend_index = groups.get(key)
             if legend_index is not None:
@@ -321,8 +335,13 @@ class CurvePlot(QWidget):
             style = Qt.PenStyle.DashLine if curve.get('direction') in ('discharge', 'DISCHARGE') else Qt.PenStyle.SolidLine
             emphasized = i in self._emphasized
             item.setPen(pg.mkPen(color, width=CURVE_WIDTH * (1.2 if emphasized else 1), style=style))
-            item.setOpacity(1.0 if emphasized or not self._emphasized else 0.32)
+            opacity = 1.0 if emphasized or not self._emphasized else 0.32
+            item.setOpacity(opacity)
             item.setZValue(1 if emphasized else 0)
+            marker = self.peak_items[i]
+            if marker is not None:
+                marker.setBrush(pg.mkBrush(color))
+                marker.setOpacity(opacity)
         previous = self.list.blockSignals(True)
         for row, group in enumerate(self._legend_groups):
             curve = self.curves[group[0]]
@@ -417,6 +436,8 @@ class CurvePlot(QWidget):
             visible = self.list.item(row).checkState() == Qt.CheckState.Checked
             for i in self._legend_groups[row]:
                 self.items[i].setVisible(visible)
+                if self.peak_items[i] is not None:
+                    self.peak_items[i].setVisible(visible)
         self._update_origin_button()
         self._update_emphasis()
 

@@ -1,3 +1,3 @@
 """Battery Analysis Studio."""
 
-APP_VERSION = "3.1.8"
+APP_VERSION = "3.1.9"

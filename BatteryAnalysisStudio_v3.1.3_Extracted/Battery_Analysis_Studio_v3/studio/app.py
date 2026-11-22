@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import APP_VERSION
-from .widgets import CurvePlot, DataTable, PALETTE, cycle_color, display_value
+from .widgets import CurvePlot, DataTable, PALETTE, cycle_gradient, display_value
 from .ingestion import load_inputs
 from .analysis import apply_cycle_baseline, prepare_cycle_tables, raw_curves, track_peaks
 from .derivative_cache import cached_derivatives
@@ -1028,7 +1028,7 @@ class StudioWindow(QMainWindow):
         channel_mode = self.color_mode.currentData() == 'channel' or (
             not prefer_cycles and self.color_mode.currentData() == 'auto'
             and len({c.get('source_id') for c in curves}) > 1)
-        colors = {cycle: cycle_color(cycle) for cycle in set(cycles)}
+        colors = cycle_gradient(cycles)
         for curve in curves:
             curve['color'] = self._channel_color(curve.get('source_id')) if channel_mode else colors[int(curve.get('cycle', 0))]
 
@@ -1140,7 +1140,7 @@ class StudioWindow(QMainWindow):
         self._color_curves(valid, prefer_cycles=True)
         for c in valid:
             c['point_kind'] = 'calculated'
-        self.dq_plot.set_curves(valid, group_cycles=True)
+        self.dq_plot.set_curves(valid, group_cycles=True, show_peaks=True)
         self.vq_plot.set_curves([dict(c, x=c['vq_x'], y=c['vq_y']) for c in valid], group_cycles=True)
         self.dvdq_plot.set_curves([dict(c, x=c['dvdq_x'], y=c['dvdq_y']) for c in valid], group_cycles=True)
         peaks = []
@@ -1164,7 +1164,7 @@ class StudioWindow(QMainWindow):
                 point_kind='calculated'))
         self.peak_trend.set_curves(trend_curves)
         self._restore_graph('dq', self.dq_plot)
-        self.dq_note.setText(f'{len(valid)}개 곡선 · 물리 Step별 분석 · 피크 추이는 최대 {shift_mv:g} mV 이동 내에서 대응 (수동 검토 필요)'
+        self.dq_note.setText(f'{len(valid)}개 곡선 · 원형 마커는 검출 피크 · 피크 추이는 최대 {shift_mv:g} mV 이동 내에서 대응 (수동 검토 필요)'
                              + (' · ' + ' / '.join(errors[:4]) if errors else ''))
         if errors:
             self.show_error(' / '.join(errors[:4]))

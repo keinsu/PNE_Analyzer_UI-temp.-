@@ -23,7 +23,7 @@ from studio.app import StudioWindow
 from studio.ingestion import load_inputs
 from studio.analysis import cycle_summary, prepare_cycle_tables, raw_curves, derivative_curves
 from studio.project import save_project, load_project
-from studio.widgets import CURVE_WIDTH, DataTable, CurvePlot, PALETTE
+from studio.widgets import CURVE_WIDTH, DataTable, CurvePlot, PALETTE, cycle_gradient
 
 
 def workspace_zip(directory):
@@ -346,6 +346,26 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual([item.opacity() for item in graph.items], [1., 1., 1.])
         graph.restore_graph_state(state)
         self.assertEqual([item.opacity() for item in graph.items], [1., 1., .32])
+        graph.deleteLater()
+
+    def test_cycle_gradient_is_ordered_and_peak_markers_follow_legend(self):
+        palette = cycle_gradient([30, 5, 10, 5])
+        self.assertEqual(list(palette), [5, 10, 30])
+        self.assertEqual(palette[5], "#00e5ff")
+        self.assertEqual(palette[30], "#ff769d")
+        self.assertNotIn(palette[10], (palette[5], palette[30]))
+        graph = CurvePlot()
+        graph.set_curves([dict(x=[3., 4.], y=[-2., -1.], cycle=5, color=palette[5],
+                               peaks=[dict(voltage=3., value=-2.)]),
+                          dict(x=[3., 4.], y=[1., 2.], cycle=10, color=palette[10])],
+                         group_cycles=True, show_peaks=True)
+        peak = graph.peak_items[0]
+        np.testing.assert_array_equal(peak.getData(), ([3.], [-2.]))
+        self.assertIsNone(graph.peak_items[1])
+        graph.list.item(1).setSelected(True)
+        self.assertAlmostEqual(peak.opacity(), .32)
+        graph.list.item(0).setCheckState(Qt.CheckState.Unchecked)
+        self.assertFalse(peak.isVisible())
         graph.deleteLater()
 
     def test_graph_uses_high_contrast_palette_and_thicker_lines(self):
