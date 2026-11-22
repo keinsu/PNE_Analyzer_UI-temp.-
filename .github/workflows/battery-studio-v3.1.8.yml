@@ -28,7 +28,7 @@ jobs:
       - name: Package single executable
         timeout-minutes: 8
         run: python -m PyInstaller --noconfirm --clean --distpath dist_onefile --workpath build_onefile BatteryAnalysisStudio_OneFile.spec
-      - name: Run packaged EXE smoke test
+      - name: Verify packaged EXE uses renumbered Cycle
         timeout-minutes: 4
         run: python tests/verify_frozen.py --exe dist_onefile/BatteryAnalysisStudio_v3_OneFile.exe --result validation/onefile_frozen_smoke.json
       - name: Publish verified Windows EXE

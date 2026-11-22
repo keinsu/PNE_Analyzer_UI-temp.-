@@ -41,7 +41,7 @@ def smoke_test(app, window, destination):
             summaries[c.id] = apply_cycle_baseline(reloaded['representative'], c.name, first_cycle=2)
         window._summaries = summaries
         window.render_summaries()
-        assert window.summary.graph.curves[0]['x'][0] == 2
+        assert window.summary.graph.curves[0]['x'][0] == 1
         assert summaries[channel.id].attrs['baseline_cycle'] == 2
         derivatives = derivative_curves(channel, [cycles[0]], direction='both')
         valid = [c for c in derivatives if not c.get('error')]
