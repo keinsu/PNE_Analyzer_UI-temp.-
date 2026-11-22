@@ -1,0 +1,49 @@
+name: Build Battery Analysis Studio v3.1.10
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/battery-studio-v3.1.10.yml]
+permissions:
+  contents: write
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: BatteryAnalysisStudio_v3.1.3_Extracted/Battery_Analysis_Studio_v3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.5'
+          architecture: x64
+      - name: Install pinned build dependencies
+        run: python -m pip install -r requirements.txt pyinstaller-hooks-contrib==2026.0 psutil==7.2.2
+      - name: Run Windows tests
+        timeout-minutes: 3
+        run: python -m unittest discover -s tests -v
+      - name: Package single executable
+        timeout-minutes: 8
+        run: python -m PyInstaller --noconfirm --clean --distpath dist_onefile --workpath build_onefile BatteryAnalysisStudio_OneFile.spec
+      - name: Run packaged EXE smoke test
+        timeout-minutes: 4
+        run: python tests/verify_frozen.py --exe dist_onefile/BatteryAnalysisStudio_v3_OneFile.exe --result validation/onefile_frozen_smoke.json
+      - name: Publish verified Windows EXE
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $asset = 'BatteryAnalysisStudio_v3.1.10_OneFile.exe'
+          Copy-Item 'dist_onefile/BatteryAnalysisStudio_v3_OneFile.exe' $asset
+          $hash = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant()
+          gh release view v3.1.10 --repo ${{ github.repository }} --json assets --jq '.assets[].name' 2>$null | ForEach-Object {
+            if ($_ -eq $asset) { exit 0 }
+          }
+          gh release create v3.1.10 $asset --repo keinsu/PNE_Analyzer_UI-temp.- --target $env:GITHUB_SHA --title "Battery Analysis Studio v3.1.10" --notes "Windows x64 single-file build. SHA-256: $hash"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+

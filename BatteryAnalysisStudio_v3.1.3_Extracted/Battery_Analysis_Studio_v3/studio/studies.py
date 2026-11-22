@@ -201,7 +201,7 @@ class Study:
         """Build an all-or-nothing revision. Selections include explicit cell/segment IDs."""
         candidate = deepcopy(self.data)
         messages = []
-        for channel, cell_id, cell_name, start, segment_id in selections:
+        for channel, cell_id, cell_name, start, segment_id, *labels in selections:
             if cancel():
                 raise InterruptedError("구간 비교 취소")
             cell = next((c for c in candidate["cells"] if c["id"] == cell_id), None)
@@ -209,7 +209,11 @@ class Study:
                 cell_name = cell_name.strip()
                 if not cell_name or any(c["name"].casefold() == cell_name.casefold() for c in candidate["cells"]):
                     raise ValueError("새 셀 이름이 비어 있거나 이미 사용 중입니다. 기존 셀을 선택하세요.")
-                cell = dict(id=uuid.uuid4().hex, name=cell_name, segments=[])
+                management_id = labels[0].strip() if labels else cell_name
+                if not management_id or any(c.get("management_id", c["name"]).casefold() == management_id.casefold()
+                                            for c in candidate["cells"]):
+                    raise ValueError("관리 ID를 입력하고 시험 내에서 중복되지 않도록 지정하세요.")
+                cell = dict(id=uuid.uuid4().hex, name=cell_name, management_id=management_id, segments=[])
                 candidate["cells"].append(cell)
             old = next((s for s in cell["segments"] if s["id"] == segment_id), None)
             if segment_id and old is None:
@@ -235,7 +239,7 @@ class Study:
             overlaps = sorted(incoming & occupied)
             if overlaps:
                 raise ValueError(f"{cell['name']}: 누적 Cycle 겹침 {', '.join(map(str, overlaps[:12]))}")
-            if old and old["store"].endswith("-compact-v1") and old.get("parse_fingerprint") == channel.fingerprint:
+            if old and old["store"].endswith("-compact-v2") and old.get("parse_fingerprint") == channel.fingerprint:
                 messages.append(f"{cell['name']}: 변경 없음")
                 continue
             signatures, changed, revisions, extended = {}, [], [], []
@@ -255,11 +259,11 @@ class Study:
                 messages.append(f"{cell['name']}: 마지막 Cycle 기록이 짧은 파일입니다. 기존 구간 유지")
                 continue
             rules = channel.metadata.get("import_rules")
-            if old and old.get("import_rules") != rules:
+            if old and (old.get("import_rules") != rules or not old["store"].endswith("-compact-v2")):
                 changed = list(cycles)
                 messages.append(f"{cell['name']}: 용량 Step 지정 갱신")
             if not changed and old:
-                if old["store"].endswith("-compact-v1") and (old["source"], old["channel"]) == (channel.source_path, channel.name):
+                if old["store"].endswith("-compact-v2") and (old["source"], old["channel"]) == (channel.source_path, channel.name):
                     messages.append(f"{cell['name']}: 변경 없음")
                     continue
                 messages.append(f"{cell['name']}: 측정값 동일, 원본 위치 정보 갱신")
@@ -320,15 +324,24 @@ class Study:
         for channel in auxiliary:
             if cancel():
                 raise InterruptedError("파일 등록 취소")
+            link = channel.metadata.get("rpt_link", {})
             kind = channel.metadata["import_kind"]
             source_id = channel.id
+            if link and not any(c["id"] == link["cell_id"] for c in candidate["cells"]):
+                raise ValueError(f"{channel.name}: 연결할 수명시험 셀이 없습니다.")
             old = next((record for record in candidate["rpt"] if record.get("id") == source_id), None)
-            if old and old.get("fingerprint") == channel.fingerprint:
+            if old and old.get("fingerprint") == channel.fingerprint and old.get("rpt_link", {}) == link:
                 messages.append(f"{channel.name}: 변경 없음")
                 continue
+            from .compact_data import prepare_channel
+            prepared = prepare_channel(channel, self.cache_dir, cancel)
+            points = [dict(Cycle=link["cycle"], Value=row["Value"]) for row in prepared.frame.rpt_rows()
+                      if link and row.get("Direction") == "DISCHARGE" and row.get("SOC_pct") == 50
+                      and row.get("Value") is not None and row["Value"] > 0]
             record = dict(id=source_id, name=channel.name, path=channel.source_path,
                           sha256=channel.metadata["sha256"], fingerprint=channel.fingerprint,
-                          kind=kind, store=self._store(channel, cancel), at=_now())
+                          kind=kind, store=prepared.frame.path.relative_to(self.directory).as_posix(),
+                          rpt_link=link, dcir50=points, at=_now())
             if old:
                 candidate["rpt"][candidate["rpt"].index(old)] = record
             else:
@@ -344,7 +357,11 @@ class Study:
                 continue
             fingerprint = hashlib.sha256(json.dumps(
                 [(s["id"], s["digest"], s["offset"], s["store"]) for s in cell["segments"]]).encode()).hexdigest()
+            points = [point for record in self.data["rpt"]
+                      if record.get("rpt_link", {}).get("cell_id") == cell["id"]
+                      for point in record.get("dcir50", [])]
             metadata = dict(input_type="study_cell", parse_fingerprint=fingerprint,
+                            management_id=cell.get("management_id", cell["name"]), dcir50=points,
                             status_counts={"CSV": 1, "REVIEW": 1})
             channels.append(ChannelData(cell["id"], cell["name"], str(self.path), store,
                                         store.step_table(), metadata, store.warnings))
@@ -360,7 +377,7 @@ class Study:
                 cached = _cache_read(path, "channel")
                 if cached:
                     channels.append(ChannelData(record["id"], record["name"], record["path"],
-                                                CompactStore(path), cached[1], cached[2]["metadata"], cached[3]))
+                                                CompactStore(path), cached[1], dict(cached[2]["metadata"], rpt_link=record.get("rpt_link", {})), cached[3]))
             except (OSError, ValueError, KeyError):
                 continue
         return channels
@@ -381,7 +398,7 @@ class StudyCellStore:
                 if not path.is_relative_to(directory):
                     raise ValueError("잘못된 저장 경로")
                 from .compact_data import CompactStore
-                raw = CompactStore(path) if path.name.endswith('-compact-v1') else RawStore(path)
+                raw = CompactStore(path) if path.name.endswith(('-compact-v1', '-compact-v2')) else RawStore(path)
             except (OSError, KeyError, ValueError, TypeError):
                 self.warnings.append(f"{segment['start']}–{segment['end']} Cycle의 상세 데이터 저장소를 찾을 수 없습니다.")
                 continue

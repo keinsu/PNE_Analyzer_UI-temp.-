@@ -82,6 +82,21 @@ class RuleDialog(QDialog):
         self.pages.addWidget(cycle)
         rpt = QWidget()
         rpt_layout = QVBoxLayout(rpt)
+        standard = QFormLayout()
+        self.rpt_steps = {}
+        for key, label, direction in (("charge", "RPT 충전용량 Step", "CHARGE"),
+                                      ("discharge", "RPT 방전용량 Step", "DISCHARGE"),
+                                      ("pulse", "방전 10초 DCR Step", "DISCHARGE")):
+            combo = QComboBox()
+            combo.addItem("선택", "")
+            for number in dict.fromkeys(step for step, mode, *_ in self.options if mode == direction):
+                combo.addItem(f"Step {number}", number)
+            self.rpt_steps[key] = combo
+            standard.addRow(label, combo)
+        self.soc_order = QLineEdit()
+        self.soc_order.setPlaceholderText("펄스 순서대로 입력 · 예: 100,90,80,70,60,50")
+        standard.addRow("반복별 SOC (%)", self.soc_order)
+        rpt_layout.addLayout(standard)
         row = QHBoxLayout()
         self.item_name = QLineEdit()
         self.item_name.setPlaceholderText("결과 이름")
@@ -131,7 +146,9 @@ class RuleDialog(QDialog):
         return dict(kind=self.kind.currentData(),
                     capacity={mode: [step for step, checkbox in picks.items() if checkbox.isChecked()]
                               for mode, picks in self.capacity.items()},
-                    rpt=list(self.items))
+                    rpt=list(self.items),
+                    rpt_protocol={**{name: combo.currentData() for name, combo in self.rpt_steps.items()},
+                                  'soc': self.soc_order.text().strip()} if self.kind.currentData() == 'rpt' else {})
 
     def set_rules(self, rules):
         index = self.kind.findData(rules["kind"])
@@ -149,6 +166,11 @@ class RuleDialog(QDialog):
             wanted = set(rules.get("capacity", {}).get(mode, []))
             for step, checkbox in picks.items():
                 checkbox.setChecked(step in wanted)
+        protocol = rules.get("rpt_protocol", {})
+        for name, combo in self.rpt_steps.items():
+            value = protocol.get(name, "")
+            combo.setCurrentIndex(max(0, combo.findData(value)))
+        self.soc_order.setText(protocol.get("soc", ""))
         self.items = list(rules.get("rpt", []))
         self.show_items()
 
@@ -246,8 +268,20 @@ class RuleDialog(QDialog):
         rules = self.rules()
         if rules["kind"] != "rpt":
             return True
-        if not self.items or any(item["step"] not in self.steps for item in self.items):
-            QMessageBox.warning(self, "RPT 항목 확인", "현재 파일에 있는 Step을 사용한 RPT 항목을 추가하세요.")
+        protocol = rules["rpt_protocol"]
+        try:
+            if any(protocol.values()):
+                if not all(protocol.values()):
+                    raise ValueError("RPT 충전·방전 용량 Step, 방전 DCR Step, 반복별 SOC를 모두 지정하세요.")
+                values = [float(value.strip()) for value in protocol["soc"].split(",")]
+                if not values or not all(0 <= value <= 100 for value in values):
+                    raise ValueError("SOC는 0~100 범위의 값을 쉼표로 구분해 입력하세요.")
+            elif not self.items:
+                raise ValueError("RPT 용량·DCR Step 또는 추출 항목을 지정하세요.")
+            if any(item["step"] not in self.steps for item in self.items):
+                raise ValueError("현재 파일에 있는 Step을 사용한 RPT 항목을 지정하세요.")
+        except ValueError as exc:
+            QMessageBox.warning(self, "RPT 항목 확인", str(exc))
             return False
         return True
 

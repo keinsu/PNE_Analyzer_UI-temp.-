@@ -27,6 +27,7 @@ from .analysis import apply_cycle_baseline, prepare_cycle_tables, raw_curves, tr
 from .derivative_cache import cached_derivatives
 from .project import save_project, load_project, project_channels, default_output_dir
 from .compact_data import CompactStore, prepare_channel
+from .measurements import dcir_changes
 from .import_dialog import classify_channels
 from .dcr_panel import DCRPanel
 from .raw_store import PREVIEW_POINTS
@@ -43,6 +44,9 @@ METRICS = {
     'CC 용량 (mAh)': 'CC_Capacity_mAh', 'CV 용량 (mAh)': 'CV_Capacity_mAh',
     'CC 시간 (s)': 'CC_Time_s', 'CV 시간 (s)': 'CV_Time_s',
     '방전 시작 저항 (mΩ)': 'Discharge_Onset_R_mOhm',
+    '충전·방전 1초 저항 (mΩ)': 'resistance_1s',
+    '충전·방전 10초 저항 (mΩ)': 'resistance_10s',
+    '방전 종료 온도 (°C)': 'Discharge_End_Temp_C',
 }
 AXES = {'Step 시간 (s)': 'StepTime_s', '누적 시간 (s)': 'TotalTime_s',
         '용량 (mAh)': 'Capacity_mAh', '전압 (V)': 'Voltage_V',
@@ -119,6 +123,7 @@ class StudioWindow(QMainWindow):
         self._tokens = {}
         self._callbacks = {}
         self._summaries = {}
+        self._dcir_baselines = {}
         self._summary_cache = {}
         self._summary_pending = None
         self._last_raw_result = None
@@ -263,6 +268,8 @@ class StudioWindow(QMainWindow):
         self.raw.table_toggle.toggled.connect(self._toggle_raw_details)
         self.raw_tables.currentChanged.connect(self._load_raw_detail)
         self.raw.table_toggle.setChecked(True)
+        self.summary.graph.origin_btn.show()
+        self.summary.graph.origin_btn.clicked.connect(self.export_summary_origin)
         self.compare = AnalysisPage('Channel / Cell Compare', '여러 시험·셀은 개별 곡선으로 비교합니다. 선택만으로 서로 이어붙이지 않습니다.')
         self.derivative = QWidget()
         dq_layout = QVBoxLayout(self.derivative)
@@ -381,6 +388,9 @@ class StudioWindow(QMainWindow):
                 self.summary_start.setValue(2)
                 self.summary_start.valueChanged.connect(self.render_summaries)
                 form.addRow('시작 Cycle (새 1)', self.summary_start)
+                reference = QPushButton('기준 DCIR 입력…')
+                reference.clicked.connect(self.edit_dcir_reference)
+                form.addRow('SOC 50% 방전 10초', reference)
             self._pages[index] = self.settings_stack.addWidget(widget)
         raw_settings = QWidget()
         form = QFormLayout(raw_settings)
@@ -958,6 +968,27 @@ class StudioWindow(QMainWindow):
         self._start('analysis', calculate, ready)
         self._summary_pending = (self._tokens['analysis'], requested)
 
+    def edit_dcir_reference(self):
+        candidates = [c for c in self.channels if c.metadata.get('input_type') == 'study_cell']
+        if not candidates:
+            self.show_error('시험 목록에서 수명시험 셀을 먼저 등록하세요.')
+            return
+        labels = [f"{c.name} · {c.metadata.get('management_id', c.name)}" for c in candidates]
+        index = next((i for i, c in enumerate(candidates) if c is self.active_channel()), 0)
+        label, ok = QInputDialog.getItem(self, 'DCIR 기준값', '수명시험 셀 / 관리 ID', labels, index, False)
+        if not ok:
+            return
+        channel = candidates[labels.index(label)]
+        value, ok = QInputDialog.getDouble(self, 'DCIR 기준값',
+            'SOC 50% 방전 10초 기준 저항 (mΩ). 0을 입력하면 수동 기준을 지웁니다.',
+            self._dcir_baselines.get(channel.id, 0.), 0., 1_000_000., 6)
+        if ok:
+            if value > 0:
+                self._dcir_baselines[channel.id] = value
+            else:
+                self._dcir_baselines.pop(channel.id, None)
+            self.render_summaries()
+
     def _display_cycles(self, frame):
         if frame is None or frame.empty:
             return frame
@@ -977,7 +1008,12 @@ class StudioWindow(QMainWindow):
                 frame = self._display_cycles(self._summaries.get(channel.id))
                 if frame is None or frame.empty:
                     continue
+                points = dcir_changes(channel.metadata.get('dcir50', []), self._dcir_baselines.get(channel.id))
+                displayed = {cycle - self.summary_start.value() + 1: change for cycle, change in points.items()
+                             if cycle >= self.summary_start.value()}
                 enriched = frame.copy()
+                if displayed:
+                    enriched['RPT_SOC50_10s_DCIR_Change_pct'] = enriched['Cycle'].map(displayed)
                 enriched.insert(0, 'Channel', channel.name)
                 enriched['Source_ID'] = channel.id
                 preferred = ['Channel', 'Cycle', 'OriginalCycle', 'Discharge_Capacity_mAh',
@@ -986,18 +1022,31 @@ class StudioWindow(QMainWindow):
                 ordered = [name for name in preferred if name in enriched]
                 enriched = enriched[ordered + [col for col in enriched if col not in ordered]]
                 frames.append(enriched)
-                if metric in frame:
+                if metric in ('resistance_1s', 'resistance_10s'):
+                    seconds = metric.removeprefix('resistance_')
+                    series = [(f'Charge_R_{seconds}_mOhm', ' · 충전', 'charge'),
+                              (f'Discharge_R_{seconds}_mOhm', ' · 방전', 'discharge')]
+                else:
+                    series = [(metric, '', '')]
+                for field, suffix, direction in series:
+                    if field not in frame:
+                        continue
                     x = frame['Cycle'].to_numpy()
-                    y = frame[metric].to_numpy(dtype=float)
+                    y = frame[field].to_numpy(dtype=float)
                     if channel.metadata.get('input_type') == 'study_cell':
                         gaps = np.flatnonzero(np.diff(x) > 1) + 1
                         y = np.insert(y, gaps, np.nan)
                         x = np.insert(x, gaps, x[gaps] - 1)
-                    curves.append(dict(x=x, y=y,
-                        name=channel.name, source_id=channel.id, point_kind='calculated',
+                    curves.append(dict(x=x, y=y, direction=direction,
+                        name=channel.name + suffix, source_id=channel.id, point_kind='calculated',
                         color=self._channel_color(channel.id)))
+                if index == 0 and metric == 'Discharge_Capacity_Retention_pct' and displayed:
+                    xs = sorted(displayed)
+                    curves.append(dict(x=xs, y=[displayed[x] for x in xs], right_axis=True,
+                        name=f'{channel.name} · SOC 50% 방전 10초 DCIR', source_id=channel.id,
+                        point_kind='calculated', color=self._channel_color(channel.id)))
             page.graph.set_labels('Cycle', combo.currentText())
-            page.graph.set_curves(curves)
+            page.graph.set_curves(curves, right_label='SOC 50% 방전 10초 DCIR 변화율 (%)')
             if index in self._dirty_pages:
                 page.graph.set_stale(True)
             page.table.set_frame(pd.concat(frames, ignore_index=True) if frames else pd.DataFrame())
@@ -1194,7 +1243,7 @@ class StudioWindow(QMainWindow):
         return dict(selected_channels=[c.id for c in self.selected_channels()],
             active_channel=self.active_channel().id if self.active_channel() else None,
             page=self.nav.currentRow(), baseline=self.baseline.text(), aggregation=self.aggregate.currentData(),
-            summary_start=self.summary_start.value(),
+            summary_start=self.summary_start.value(), dcir_baselines=dict(self._dcir_baselines),
             include_review=self.include_review.isChecked(),
             color_mode=self.color_mode.currentData(),
             metrics={str(k): v.currentData() for k, v in self.metric_widgets.items()},
@@ -1209,6 +1258,7 @@ class StudioWindow(QMainWindow):
         self._restoring = True
         try:
             self.baseline.setText(str(state.get('baseline', '')))
+            self._dcir_baselines = dict(state.get('dcir_baselines', {}))
             self.summary_start.setValue(int(state.get('summary_start', 2)))
             self.aggregate.setCurrentIndex(max(0, self.aggregate.findData(state.get('aggregation', 'representative'))))
             self.include_review.setChecked(bool(state.get('include_review', False)))
@@ -1417,6 +1467,23 @@ class StudioWindow(QMainWindow):
         if path:
             self._start('export', lambda progress, cancel: self._write_csv(channel, path, cancel),
                         lambda _: self.statusBar().showMessage(f'Raw CSV 저장 완료 · {path}'))
+
+    def export_summary_origin(self):
+        from .origin_export import prepare_summary_curves, paste_origin_to_powerpoint
+
+        graph = self.summary.graph
+        curves = prepare_summary_curves(graph.checked_curves())
+        if graph._stale or not curves:
+            self.show_error('Summary를 계산하고 범례에서 붙여넣을 곡선을 체크하세요.')
+            return
+        if 'origin_export' in self._jobs or 'origin_export' in self._queued_jobs:
+            return
+        y_label = graph.plot.getAxis('left').labelText
+        ranges = tuple(tuple(axis) for axis in graph.plot.viewRange())
+        right_label = graph.right_label if any(c.right_axis for c in curves) else ''
+        self._start('origin_export', lambda progress, cancel: paste_origin_to_powerpoint(
+            curves, 'Summary', 'Cycle', y_label, progress, cancel, ranges, right_label=right_label),
+            lambda slide: self.statusBar().showMessage(f'PPT 붙여넣기 완료 · {slide}'))
 
     def export_origin(self, graph, title):
         from .origin_export import paste_origin_to_powerpoint, prepare_curves

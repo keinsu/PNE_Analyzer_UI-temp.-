@@ -23,6 +23,7 @@ class OriginCurve:
     y: np.ndarray
     color: str
     dash: bool
+    right_axis: bool = False
 
 
 def prepare_curves(curves, source_id):
@@ -47,6 +48,20 @@ def prepare_curves(curves, source_id):
         color = str(curve.get("color", "#2679B5"))
         result.append(OriginCurve(unique, str(curve.get("name", unique)), x, y,
                                   color if _COLOR.fullmatch(color) else "#2679B5", direction == "discharge"))
+    return result
+
+
+def prepare_summary_curves(curves):
+    result = []
+    for curve in curves:
+        x, y = np.asarray(curve["x"], dtype=float), np.asarray(curve["y"], dtype=float)
+        if x.ndim != 1 or y.ndim != 1 or len(x) != len(y) or not np.any(np.isfinite(x) & np.isfinite(y)):
+            continue
+        name = str(curve.get("name", "Summary"))
+        color = str(curve.get("color", "#2679B5"))
+        right = bool(curve.get("right_axis"))
+        result.append(OriginCurve(name, name, x, y, color if _COLOR.fullmatch(color) else "#2679B5",
+                                  right or curve.get("direction") == "discharge", right))
     return result
 
 
@@ -91,16 +106,21 @@ def _check(cancel):
         raise InterruptedError("PPT 붙여넣기 취소")
 
 
-def _build_graph(app, curves, name, x_label, y_label, progress, cancel, ranges):
+def _build_graph(app, curves, name, x_label, y_label, progress, cancel, ranges, right_label=''):
     book = app.WorksheetPages.Add("Origin")
     book.LongName = name
     sheet = book.Layers(0)
     sheet.Cols = 2 * len(curves)
     sheet.Rows = max(len(curve.x) for curve in curves)
-    graph = app.GraphPages.Add("Origin")
+    graph = app.GraphPages.Add("DoubleY" if right_label else "Origin")
     graph.LongName = name
-    layer = graph.Layers(0)
-    styles = []
+    layers = [graph.Layers(0)]
+    if right_label:
+        try:
+            layers.append(graph.Layers(1))
+        except Exception as exc:
+            raise RuntimeError("Origin의 DoubleY 템플릿에서 오른쪽 축을 열 수 없습니다.") from exc
+    styles = [[] for layer in layers]
     for i, curve in enumerate(curves):
         _check(cancel)
         progress(i, len(curves), f"Origin · {curve.label}")
@@ -108,7 +128,9 @@ def _build_graph(app, curves, name, x_label, y_label, progress, cancel, ranges):
         x_column, y_column = sheet.Columns(x_col), sheet.Columns(y_col)
         x_column.Type, y_column.Type = 3, 0  # Origin COLTYPE_X and COLTYPE_Y.
         x_column.LongName, y_column.LongName = x_label, curve.label
-        y_column.Comments = f"{y_label} · {curve.description}"
+        side = int(bool(right_label and curve.right_axis))
+        layer = layers[side]
+        y_column.Comments = f"{right_label if side else y_label} · {curve.description}"
         for start in range(0, len(curve.x), _TRANSFER_ROWS):
             _check(cancel)
             end = start + _TRANSFER_ROWS
@@ -117,19 +139,24 @@ def _build_graph(app, curves, name, x_label, y_label, progress, cancel, ranges):
                 if not app.PutWorksheet(book.Name, data, start, column):
                     raise RuntimeError(f"Origin에 {curve.label} 데이터를 쓰지 못했습니다.")
         data_range = sheet.NewDataRange(0, x_col, len(curve.x) - 1, y_col)
-        if layer.DataPlots.Add(data_range, 200 if len(curve.x) > 1 else 201) is None:
+        plot_type = 201 if side or np.count_nonzero(np.isfinite(curve.y)) == 1 else 200
+        if layer.DataPlots.Add(data_range, plot_type) is None:
             raise RuntimeError(f"Origin에서 {curve.label} 곡선을 그리지 못했습니다.")
-        styles.append(f'layer.plot={i + 1}; set %C -cl color("{curve.color}"); '
+        styles[side].append(f'layer.plot={len(styles[side]) + 1}; set %C -cl color("{curve.color}"); '
                       f'set %C -d {1 if curve.dash else 0}; set %C -wp 1.6;')
     axes = []
     for axis, limits in zip(("x", "y"), ranges):
         if len(limits) == 2 and all(math.isfinite(v) for v in limits) and limits[0] < limits[1]:
             axes.append(f"layer.{axis}.from={limits[0]:.16g}; layer.{axis}.to={limits[1]:.16g};")
-    script = ' '.join(styles + ['layer -a;', *axes, f'label -xb "{_axis_text(x_label)}";',
-                                f'label -yl "{_axis_text(y_label)}";',
-                                'legendupdate dest:=layer update:=reconstruct mode:=lname;'])
-    if not layer.Execute(script):
+    legend = 'legendupdate dest:=layer update:=reconstruct mode:=lname;'
+    left_script = ' '.join(styles[0] + ['layer -a;', *axes, f'label -xb "{_axis_text(x_label)}";',
+                                      f'label -yl "{_axis_text(y_label)}";', legend])
+    if not layers[0].Execute(left_script):
         raise RuntimeError("Origin에서 축과 Cycle 범례를 설정하지 못했습니다.")
+    if right_label:
+        right_script = ' '.join(styles[1] + ['layer -a;', f'label -yr "{_axis_text(right_label)}";', legend])
+        if not layers[1].Execute(right_script):
+            raise RuntimeError("Origin에서 오른쪽 DCIR 축을 설정하지 못했습니다.")
     return graph.Name
 
 
@@ -206,7 +233,7 @@ def _paste_graph(slide, graph, app, size, cancel):
         raise
 
 
-def paste_origin_to_powerpoint(curves, name, x_label, y_label, progress, cancel, ranges=()):
+def paste_origin_to_powerpoint(curves, name, x_label, y_label, progress, cancel, ranges=(), *, right_label=''):
     if not curves:
         raise ValueError("PPT에 붙여넣을 Cycle 곡선을 선택하세요.")
     _check(cancel)
@@ -219,7 +246,8 @@ def paste_origin_to_powerpoint(curves, name, x_label, y_label, progress, cancel,
             progress(0, len(curves), f"{deck_name} · {number}번 슬라이드용 그래프 준비 중")
             with _origin_session() as app:
                 try:
-                    graph = _build_graph(app, curves, name, x_label, y_label, progress, cancel, ranges)
+                    axis_options = {'right_label': right_label} if right_label else {}
+                    graph = _build_graph(app, curves, name, x_label, y_label, progress, cancel, ranges, **axis_options)
                     _check(cancel)
                     progress(len(curves), len(curves), f"{deck_name} · {number}번 슬라이드에 붙여넣는 중")
                     _paste_graph(slide, graph, app, size, cancel)

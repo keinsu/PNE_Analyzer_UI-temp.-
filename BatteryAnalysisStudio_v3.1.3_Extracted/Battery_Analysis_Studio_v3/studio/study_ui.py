@@ -2,6 +2,7 @@
 from pathlib import Path
 import os
 from copy import deepcopy
+from dataclasses import replace
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout,
@@ -145,7 +146,61 @@ class StudyWorkspace:
         self.host._start("study", lambda progress, cancel: load_inputs(
             paths, progress, cancel, csv_options=csv_options), ready)
 
+    def _link_rpt(self, study, channels):
+        rpt = [channel for channel in channels if channel.metadata.get("import_kind") == "rpt"]
+        if not rpt:
+            return channels
+        cells = study.data["cells"]
+        if not cells:
+            QMessageBox.warning(self.host, "RPT 연결", "수명시험 셀을 먼저 등록한 다음 RPT를 추가하세요.")
+            return None
+        dialog = QDialog(self.host)
+        dialog.setWindowTitle("RPT 측정 시점과 셀 연결")
+        layout = QVBoxLayout(dialog)
+        grid = QTableWidget(len(rpt), 3)
+        grid.setHorizontalHeaderLabels(["RPT 채널", "수명시험 셀 / 관리 ID", "측정 시점 Cycle"])
+        grid.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(grid)
+        inputs = []
+        for i, channel in enumerate(rpt):
+            grid.setItem(i, 0, QTableWidgetItem(channel.name))
+            cell = QComboBox()
+            cell.addItem("직접 선택", None)
+            for entry in cells:
+                cell.addItem(f"{entry['name']} · {entry.get('management_id', entry['name'])}", entry["id"])
+            cycle = QSpinBox()
+            cycle.setRange(0, 100_000_000)
+            cycle.setSpecialValueText("직접 입력")
+            old = next((record.get("rpt_link", {}) for record in study.data["rpt"]
+                        if record.get("id") == channel.id), {})
+            if old:
+                cell.setCurrentIndex(max(0, cell.findData(old["cell_id"])))
+                cycle.setValue(old["cycle"])
+            grid.setCellWidget(i, 1, cell)
+            grid.setCellWidget(i, 2, cycle)
+            inputs.append((channel, cell, cycle))
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        layout.addWidget(buttons)
+
+        def confirm():
+            if any(cell.currentData() is None or cycle.value() < 1 for _, cell, cycle in inputs):
+                QMessageBox.warning(dialog, "RPT 연결", "모든 RPT 채널의 셀과 측정 시점 Cycle을 지정하세요.")
+                return
+            dialog.accept()
+
+        buttons.accepted.connect(confirm)
+        buttons.rejected.connect(dialog.reject)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        links = {channel.id: dict(cell_id=cell.currentData(), cycle=cycle.value())
+                 for channel, cell, cycle in inputs}
+        return [replace(c, metadata=dict(c.metadata, rpt_link=links[c.id])) if c.id in links else c
+                for c in channels]
+
     def _prepare_import(self, study, selection, auxiliary):
+        auxiliary = self._link_rpt(study, auxiliary)
+        if auxiliary is None:
+            return
         self.host._start("study", lambda progress, cancel: study.preview_cycles(selection, cancel, auxiliary),
                          lambda result: self._confirm(study, result))
 
@@ -155,8 +210,8 @@ class StudyWorkspace:
         dialog.resize(1000, 510)
         layout = QVBoxLayout(dialog)
         layout.addWidget(QLabel("새 구간의 누적 시작 Cycle을 직접 입력하세요. 기존 구간을 갱신하면 저장된 시작 번호를 사용합니다."))
-        grid = QTableWidget(len(channels), 5)
-        grid.setHorizontalHeaderLabels(["원본 채널 / Cycle", "연결 대상", "새 셀 이름", "누적 시작", "누적 범위"])
+        grid = QTableWidget(len(channels), 6)
+        grid.setHorizontalHeaderLabels(["원본 채널 / Cycle", "연결 대상", "새 셀 이름", "관리 ID", "누적 시작", "누적 범위"])
         grid.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         layout.addWidget(grid)
         rows = []
@@ -174,17 +229,19 @@ class StudyWorkspace:
                     mapping.addItem(f"{cell['name']} · {segment['start']}–{segment['end']} 갱신",
                                     (cell["id"], segment["id"], segment["start"]))
             name = QLineEdit(f"Cell-{len(study.data['cells']) + i + 1:02d}")
+            management_id = QLineEdit(name.text())
             start = QSpinBox()
             start.setRange(-1, 100_000_000)
             start.setSpecialValueText("직접 입력")
             start.setValue(-1)
             preview = QLabel()
-            for col, widget in enumerate((mapping, name, start, preview), 1):
+            for col, widget in enumerate((mapping, name, management_id, start, preview), 1):
                 grid.setCellWidget(i, col, widget)
 
-            def display(*_, combo=mapping, edit=name, number=start, label=preview, source_cycles=cycles):
+            def display(*_, combo=mapping, edit=name, identifier=management_id, number=start, label=preview, source_cycles=cycles):
                 pick = combo.currentData()
                 edit.setEnabled(pick is not None and not pick[0])
+                identifier.setEnabled(edit.isEnabled())
                 number.setEnabled(pick is not None and pick[1] is None)
                 effective = (pick[2] if pick[1] else number.value()) if pick else -1
                 label.setText(f"{effective}–{effective + source_cycles[-1] - source_cycles[0]}"
@@ -198,19 +255,20 @@ class StudyWorkspace:
                         mapping.setCurrentIndex(index)
                         break
             display()
-            rows.append((channel, mapping, name, start))
+            rows.append((channel, mapping, name, start, management_id))
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         layout.addWidget(buttons)
         selection = []
 
         def accept():
-            for channel, mapping, name, start in rows:
+            for channel, mapping, name, start, management_id in rows:
                 value = mapping.currentData()
-                if value and (not channel.cycles or (not value[1] and start.value() < 0)):
-                    QMessageBox.warning(dialog, "연결 확인", "Cycle이 있는 채널을 선택하고 누적 시작 Cycle을 입력하세요.")
+                if value and (not channel.cycles or (not value[1] and start.value() < 0)
+                              or (not value[0] and not management_id.text().strip())):
+                    QMessageBox.warning(dialog, "연결 확인", "Cycle이 있는 채널을 선택하고 누적 시작 Cycle과 새 셀의 관리 ID를 입력하세요.")
                     return
-            selection[:] = [(c, m.currentData()[0], n.text(), s.value(), m.currentData()[1])
-                            for c, m, n, s in rows if m.currentData()]
+            selection[:] = [(c, m.currentData()[0], n.text(), s.value(), m.currentData()[1], identifier.text())
+                            for c, m, n, s, identifier in rows if m.currentData()]
             dialog.accept()
 
         buttons.accepted.connect(accept)

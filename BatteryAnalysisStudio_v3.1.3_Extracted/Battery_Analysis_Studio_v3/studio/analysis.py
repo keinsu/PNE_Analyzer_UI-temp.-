@@ -153,6 +153,7 @@ def cycle_aggregates(channel, include_review=False, *, modes=_AGGREGATIONS, canc
     frame = analysis_frame(channel, include_review, frame=selected, columns=_CYCLE_COLUMNS)
     if frame.empty and not allow_empty:
         raise ValueError("계산에 사용할 확인된 데이터가 없습니다. 매칭 검토 상태를 확인하세요.")
+    from .measurements import onset_context, onset_resistances
     capacity_rules = getattr(channel, "metadata", {}).get("import_rules", {}).get("capacity", {})
     rows = {mode: [] for mode in modes}
     warnings = {mode: [] for mode in modes}
@@ -174,6 +175,20 @@ def cycle_aggregates(channel, include_review=False, *, modes=_AGGREGATIONS, canc
             representative = _compute_one_cycle_row(selected, cycle, None, {})
         except Exception as exc:
             representative = {"Cycle": int(cycle), "AnalysisError": str(exc)}
+        measurements = {}
+        subset = subset.sort_values("_row", kind="stable")
+        for kind, prefix, default in zip(directions, ("Charge", "Discharge"), chosen):
+            relevant = matching[kind] if explicit[kind] else ([default] if default is not None else [])
+            for seconds in (1, 10):
+                measurements[f"{prefix}_R_{seconds}s_mOhm"] = np.nan
+            if relevant:
+                context = onset_context(subset, relevant[0])
+                for seconds, value in onset_resistances(context, (1, 10)).items():
+                    measurements[f"{prefix}_R_{seconds}s_mOhm"] = value
+                if kind == "DISCHARGE" and "Temp_C" in relevant[-1]:
+                    temperature = pd.to_numeric(relevant[-1]["Temp_C"], errors="coerce").dropna()
+                    if len(temperature):
+                        measurements["Discharge_End_Temp_C"] = float(temperature.iloc[-1])
         details = dict(Source_ID=channel.id, Source_File=channel.name,
                    OriginalCycle=subset["OriginalCycle"].iloc[0] if "OriginalCycle" in subset else cycle,
                    Charge_Step_Count=counts["CHARGE"], Discharge_Step_Count=counts["DISCHARGE"],
@@ -202,7 +217,7 @@ def cycle_aggregates(channel, include_review=False, *, modes=_AGGREGATIONS, canc
             if row.get("AnalysisError"):
                 message.append(f"계산 실패: {row['AnalysisError']}")
             row.setdefault("AnalysisError", "")
-            row.update(details, Aggregation=mode, Warnings="; ".join(message))
+            row.update(details, **measurements, Aggregation=mode, Warnings="; ".join(message))
             rows[mode].append(row)
             warnings[mode].extend(f"Cycle {cycle}: {text}" for text in message)
     result = {mode: pd.DataFrame(rows[mode]) for mode in modes}
@@ -217,7 +232,7 @@ def prepare_cycle_tables(channel, include_review, cache_dir, cancel=None):
         return stored(include_review)
     from .ingestion import _cache_read, _cache_write
 
-    payload = json.dumps(["cycle-tables-v1", channel.id, channel.fingerprint, channel.name, include_review])
+    payload = json.dumps(["cycle-tables-v2", channel.id, channel.fingerprint, channel.name, include_review])
     key = hashlib.sha256(payload.encode()).hexdigest()
     cached = _cache_read(cache_dir, key)
     if cached is not None:

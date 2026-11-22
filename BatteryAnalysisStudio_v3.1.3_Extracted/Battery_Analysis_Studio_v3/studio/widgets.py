@@ -157,6 +157,8 @@ class CurvePlot(QWidget):
         self._emphasized = set()
         self._legend_groups = []
         self._curve_to_legend = []
+        self.right_view = None
+        self.right_label = ''
         self._history = []
         self._restoring = False
         self._stale = False
@@ -256,7 +258,29 @@ class CurvePlot(QWidget):
         self.plot.setLabel('bottom', x)
         self.plot.setLabel('left', y)
 
-    def set_curves(self, curves, *, group_cycles=False, show_peaks=False):
+    def _resize_right_axis(self):
+        main = self.plot.getViewBox()
+        self.right_view.setGeometry(main.sceneBoundingRect())
+        self.right_view.linkedViewChanged(main, pg.ViewBox.XAxis)
+
+    def _configure_right_axis(self, label):
+        plot = self.plot.plotItem
+        if self.right_view is None and label:
+            self.right_view = pg.ViewBox(enableMouse=False, enableMenu=False)
+            self.plot.scene().addItem(self.right_view)
+            self.right_view.setXLink(plot.vb)
+            plot.getAxis('right').linkToView(self.right_view)
+            plot.vb.sigResized.connect(self._resize_right_axis)
+        if self.right_view is not None:
+            self.right_view.clear()
+            self.right_view.setVisible(bool(label))
+            plot.showAxis('right', show=bool(label))
+            if label:
+                plot.setLabel('right', label)
+                self._resize_right_axis()
+        self.right_label = label
+
+    def set_curves(self, curves, *, group_cycles=False, show_peaks=False, right_label=''):
         self.curves = [c for c in curves if len(c.get('x', [])) and len(c.get('x', [])) == len(c.get('y', []))]
         self.items = []
         self.peak_items = []
@@ -268,17 +292,25 @@ class CurvePlot(QWidget):
         self.list.blockSignals(True)
         self.list.clear()
         self.plot.clear()
+        self._configure_right_axis(right_label if any(c.get('right_axis') for c in self.curves) else '')
         self._add_cursor()
         for i, curve in enumerate(self.curves):
             color = curve.get('color', PALETTE[i % len(PALETTE)])
-            style = Qt.PenStyle.DashLine if curve.get('direction') in ('discharge', 'DISCHARGE') else Qt.PenStyle.SolidLine
+            style = Qt.PenStyle.DashLine if curve.get('right_axis') or curve.get('direction') in ('discharge', 'DISCHARGE') else Qt.PenStyle.SolidLine
             x, y = np.asarray(curve['x'], dtype=float), np.asarray(curve['y'], dtype=float)
             curve['_x_sorted'] = bool(len(x) < 2 or np.all(np.diff(x) >= 0))
             indices = curve.get('plot_indices')
             plot_x, plot_y = (x[indices], y[indices]) if indices is not None else (x, y)
-            item = self.plot.plot(plot_x, plot_y, name=curve.get('name', str(i)),
-                                  pen=pg.mkPen(color, width=CURVE_WIDTH, style=style), connect='finite')
-            if curve['_x_sorted']:
+            item = pg.PlotDataItem(plot_x, plot_y, name=curve.get('name', str(i)),
+                                   pen=pg.mkPen(color, width=CURVE_WIDTH, style=style), connect='finite',
+                                   symbol='o' if curve.get('right_axis') else None, symbolSize=7)
+            if curve.get('right_axis'):
+                item.setSymbolBrush(color)
+                item.setSymbolPen(pg.mkPen(color))
+                self.right_view.addItem(item)
+            else:
+                self.plot.addItem(item)
+            if curve['_x_sorted'] and not curve.get('right_axis'):
                 item.setDownsampling(auto=True, method='peak')
                 item.setClipToView(True)
             item.setCurveClickable(True, width=8)
@@ -332,7 +364,7 @@ class CurvePlot(QWidget):
     def update_colors(self):
         for i, (curve, item) in enumerate(zip(self.curves, self.items)):
             color = curve.get('color', PALETTE[i % len(PALETTE)])
-            style = Qt.PenStyle.DashLine if curve.get('direction') in ('discharge', 'DISCHARGE') else Qt.PenStyle.SolidLine
+            style = Qt.PenStyle.DashLine if curve.get('right_axis') or curve.get('direction') in ('discharge', 'DISCHARGE') else Qt.PenStyle.SolidLine
             emphasized = i in self._emphasized
             item.setPen(pg.mkPen(color, width=CURVE_WIDTH * (1.2 if emphasized else 1), style=style))
             opacity = 1.0 if emphasized or not self._emphasized else 0.32
@@ -399,6 +431,14 @@ class CurvePlot(QWidget):
                 indices = curve['plot_indices']
                 item.setData(curve['x'][indices], curve['y'][indices], connect='finite')
         self.plot.autoRange()
+        if self.right_label:
+            self.right_view.enableAutoRange(axis=pg.ViewBox.YAxis)
+            self.right_view.updateAutoRange()
+            bounds = self.plot.viewRange()[0]
+            right_x = [c['x'] for c in self.curves if c.get('right_axis')]
+            lo, hi = min(np.min(x) for x in right_x), max(np.max(x) for x in right_x)
+            if lo < bounds[0] or hi > bounds[1]:
+                self.plot.setXRange(min(lo, bounds[0]), max(hi, bounds[1]), padding=.02)
         self._history = [self.plot.viewRange()]
         for edit in self.axis_inputs:
             edit.clear()
@@ -477,16 +517,17 @@ class CurvePlot(QWidget):
         view = self.plot.getViewBox()
         if not self.plot.sceneBoundingRect().contains(pos):
             return
-        pt = view.mapSceneToView(pos)
-        ranges = view.viewRange()
-        sx = max(1e-12, ranges[0][1] - ranges[0][0])
-        sy = max(1e-12, ranges[1][1] - ranges[1][0])
         candidates = sorted(self._emphasized) if self._emphasized else range(len(self.curves))
         best = None
         for i in candidates:
             if not self.items[i].isVisible():
                 continue
             curve = self.curves[i]
+            axes = self.right_view if curve.get('right_axis') else view
+            pt = axes.mapSceneToView(pos)
+            ranges = axes.viewRange()
+            sx = max(1e-12, ranges[0][1] - ranges[0][0])
+            sy = max(1e-12, ranges[1][1] - ranges[1][0])
             x, y = np.asarray(curve['x']), np.asarray(curve['y'])
             if curve.get('_x_sorted'):
                 j = int(np.searchsorted(x, pt.x()))
@@ -512,9 +553,11 @@ class CurvePlot(QWidget):
         if best is None:
             return
         _, i, k, x0, y0 = best
+        display_y = (view.mapSceneToView(self.right_view.mapViewToScene(pg.Point(x0, y0))).y()
+                     if self.curves[i].get('right_axis') else y0)
         self.vline.setPos(x0)
-        self.hline.setPos(y0)
-        self.marker.setData([x0], [y0])
+        self.hline.setPos(display_y)
+        self.marker.setData([x0], [display_y])
         for item in (self.vline, self.hline, self.marker):
             item.show()
         curve = self.curves[i]

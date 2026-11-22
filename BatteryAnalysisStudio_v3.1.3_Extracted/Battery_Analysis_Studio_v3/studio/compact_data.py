@@ -152,7 +152,7 @@ def prepare_channel(channel, root, cancel=None, *, components=()):
     root = Path(root)
     if isinstance(channel.frame, CompactStore):
         return channel
-    path = root / (channel.fingerprint + "-compact-v1")
+    path = root / (channel.fingerprint + "-compact-v2")
     try:
         cached = _cache_read(path, "channel")
         if cached is not None:
@@ -164,7 +164,24 @@ def prepare_channel(channel, root, cancel=None, *, components=()):
     try:
         fixed_dcr = {}
         kind = channel.metadata.get("import_kind", "cycle")
-        extracted = rpt_rows(channel, channel.metadata["import_rules"]["rpt"], cancel) if kind == "rpt" else []
+        from .measurements import rpt_pulses
+        extracted = []
+        if kind == "rpt":
+            rules = channel.metadata["import_rules"]
+            extracted = rpt_rows(channel, rules["rpt"], cancel)
+            protocol = rules.get("rpt_protocol", {})
+            if protocol.get("charge"):
+                capacity_rules = [dict(name=name, step=protocol[key], field="Capacity_mAh", operation="delta")
+                                  for key, name in (("charge", "RPT 충전용량"), ("discharge", "RPT 방전용량"))]
+                parts = rpt_rows(channel, capacity_rules, cancel)
+                for rule in capacity_rules:
+                    values = [abs(row["Value"]) for row in parts
+                              if row["Item"] == rule["name"] and row["Value"] is not None]
+                    extracted.append(dict(Item=rule["name"], Step=rule["step"],
+                                          Value=sum(values) if values else None,
+                                          Status="계산됨" if values else "측정값 부족"))
+                socs = [float(value.strip()) for value in protocol["soc"].split(",")]
+                extracted.extend(rpt_pulses(analysis_frame(channel), protocol["pulse"], socs, cancel))
         for review in (False, True):
             label = str(int(review))
             has_review = bool(channel.metadata.get("status_counts", {}).get("REVIEW"))
@@ -190,7 +207,7 @@ def prepare_channel(channel, root, cancel=None, *, components=()):
         if any(_cache_read(data, f"summary-{label}") is None for label in (0, 1)):
             raise OSError("Cycle 요약을 저장할 수 없습니다.")
         metadata = dict(channel.metadata, compact_curves=True, disk_backed=True, original_rows=channel.row_count,
-                        parse_fingerprint=channel.fingerprint + '-compact-v1')
+                        parse_fingerprint=channel.fingerprint + '-compact-v2')
         _cache_write(data, "channel", (pd.DataFrame(), channel.steps,
                                      {"metadata": metadata, "fixed_dcr": fixed_dcr, "rpt_rows": extracted}, channel.warnings), cancel)
         if _cache_read(data, "channel") is None:
