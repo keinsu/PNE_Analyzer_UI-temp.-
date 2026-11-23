@@ -457,7 +457,8 @@ class Study:
             fingerprint = hashlib.sha256(json.dumps(
                 [(s["id"], s["digest"], s["offset"], s["store"]) for s in cell["segments"]]).encode()).hexdigest()
             checkpoints = [record for record in records if record["rpt_link"].get("stage") != "bol"]
-            points = [point for record in checkpoints for point in record.get("dcir50", [])]
+            points = [dict(point, stage=record["rpt_link"].get("stage")) for record in checkpoints
+                      for point in record.get("dcir50", [])]
             reference = cells_by_id.get(cell.get("bol_reference_id"), cell)
             source_records = [record for record in linked.get(reference["id"], [])
                               if record["rpt_link"].get("stage") == "bol"]
@@ -469,7 +470,7 @@ class Study:
                             management_id=cell.get("management_id", cell["name"]), dcir50=points,
                             has_life=bool(cell["segments"]),
                             latest_cycle=max((s["end"] for s in cell["segments"]), default=None),
-                            latest_rpt_cycle=max((r["rpt_link"]["cycle"] for r in checkpoints if isinstance(r["rpt_link"].get("cycle"), int)), default=None),
+                            latest_rpt_cycle=max((r["rpt_link"]["cycle"] for r in checkpoints if isinstance(r["rpt_link"].get("cycle"), int)), default=0 if any(r["rpt_link"].get("stage") == "bol" for r in records) else None),
                             has_bol=any(r["rpt_link"].get("stage") == "bol" for r in records),
                             timeline=self.timeline(cell["id"]),
                             reference_bol_cell_id=reference["id"] if source_records else None,

@@ -66,12 +66,12 @@ def rpt_pulses(frame, step, socs, cancel=None):
 
 def dcir_changes(points, manual_baseline=None, *, bol_baseline=None):
     """Use an unambiguous Cycle 1 measurement or a user-entered mΩ reference."""
-    baseline_rows = [p["Value"] for p in points if p["Cycle"] == 1]
+    baseline_rows = [p["Value"] for p in points if p["Cycle"] == 1 and p.get("stage") is None]
     baseline = bol_baseline if bol_baseline is not None else (
         baseline_rows[0] if len(baseline_rows) == 1 else manual_baseline)
     if baseline is None or not np.isfinite(baseline) or baseline <= 0:
         return {}
-    result = {1: 0.0} if not baseline_rows and manual_baseline is not None and bol_baseline is None else {}
+    result = {1: 0.0} if not any(p['Cycle'] == 1 for p in points) and manual_baseline is not None and bol_baseline is None else {}
     counts = {}
     for point in points:
         cycle = point["Cycle"]

@@ -471,7 +471,13 @@ class StudioWindow(QMainWindow):
             self._pages[index] = self.settings_stack.addWidget(widget)
         raw_settings = QWidget()
         form = QFormLayout(raw_settings)
+        self.raw_scope = QComboBox()
+        self.raw_scope.addItem('수명 Cycle', 'life')
+        self.raw_scope.addItem('선택한 RPT 시점', 'rpt')
         self.raw_cycles = QLineEdit('1')
+        self.raw_scope.currentIndexChanged.connect(lambda: self.raw_cycles.setEnabled(self.raw_scope.currentData() == 'life'))
+        self.raw_scope.currentIndexChanged.connect(self.mark_dirty)
+        form.addRow('분석 대상', self.raw_scope)
         self.raw_cycles.setPlaceholderText('1,5,10-50:5')
         self.raw_direction = QComboBox()
         for text, key in [('전체', 'ALL'), ('충전', 'CHARGE'), ('방전', 'DISCHARGE'), ('Rest', 'REST')]:
@@ -607,7 +613,9 @@ class StudioWindow(QMainWindow):
             self.dcr.set_active_channel(channel.id, auto_detect=self.nav.currentRow() == DCR and not self._restoring)
             self.update_cards()
             if self.nav.currentRow() == RAW and not self._restoring:
-                self._show_raw_tables(channel)
+                detail = self._raw_detail_channel()
+                if detail:
+                    self._show_raw_tables(detail)
         if not self._restoring and self.study_workspace.study:
             self._selection_changed()
 
@@ -661,7 +669,7 @@ class StudioWindow(QMainWindow):
             self._load_raw_detail()
 
     def _load_raw_detail(self, *_):
-        channel = self.active_channel()
+        channel = self._raw_detail_channel()
         if channel:
             self._show_raw_tables(channel)
 
@@ -914,6 +922,7 @@ class StudioWindow(QMainWindow):
         self._derivative_tabs_ready.clear()
         self._rpt_curve_ids = ()
         self._overview_context = self._rpt_context = None
+        self.raw_scope.setCurrentIndex(0)
         self.curve_source.blockSignals(True)
         self.curve_source.setCurrentIndex(0)
         self.curve_source.blockSignals(False)
@@ -1027,8 +1036,8 @@ class StudioWindow(QMainWindow):
             return
         if row in (0, 1, 5):
             self.calculate_summaries()
-        elif row == 2:
-            channel = self.active_channel()
+        elif row == RAW:
+            channel = self._raw_detail_channel()
             if channel:
                 self._show_raw_tables(channel)
             self.calculate_raw()
@@ -1150,7 +1159,7 @@ class StudioWindow(QMainWindow):
         if frame is None or frame.empty:
             return frame
         start = self.summary_start.value()
-        visible = frame.loc[frame['Cycle'] >= start].copy()
+        visible = frame.loc[frame['Cycle'] >= start].sort_values('Cycle', kind='stable')
         offset = self._cycle_offset()
         if offset:
             visible['Source_Cycle'] = visible['Cycle']
@@ -1297,6 +1306,7 @@ class StudioWindow(QMainWindow):
         return cycles
 
     def _open_raw_view(self):
+        self.raw_scope.setCurrentIndex(self.raw_scope.findData(self.curve_source.currentData()))
         self.advanced_navigation.setChecked(True)
         self.nav.setCurrentRow(RAW)
 
@@ -1319,9 +1329,9 @@ class StudioWindow(QMainWindow):
             self._restoring = False
         self.calculate_derivatives()
 
-    def _curve_targets(self, edit):
+    def _curve_targets(self, edit, source):
         cell = self.active_channel()
-        if self.curve_source.currentData() == 'rpt':
+        if source == 'rpt':
             allowed = rpt_checkpoints(cell, self.channels)
             if not self.study_workspace.study and not allowed:
                 allowed = [c for c in self.channels if c.metadata.get('import_kind') == 'rpt']
@@ -1329,16 +1339,42 @@ class StudioWindow(QMainWindow):
             chosen = [by_id[id_] for id_ in self._rpt_curve_ids if id_ in by_id]
             if not chosen:
                 raise ValueError('RPT 비교에서 시점을 체크한 뒤 dQ/dV 비교를 누르세요.')
-            return [(c, c.cycles[:1]) for c in chosen if c.cycles]
+            return [(c, ()) for c in chosen]
         all_channels = self.selected_channels()
         if self.study_workspace.study:
             all_channels = [c for c in all_channels if c.metadata.get('has_life', True)]
         cycles = self._cycles(edit)
         return [(channel, cycles) for channel in all_channels]
 
+    @staticmethod
+    def _rpt_step_cycles(channel, steps, direction=None):
+        if not steps:
+            return list(channel.cycles[:1])
+        wanted = {step.strip() for step in steps.split(',') if step.strip()}
+        table = read_step_table(channel)
+        if not {'StepNo', 'Cycle', 'TypeStd'}.issubset(table.columns):
+            table = channel.read_rows(columns=['StepNo', 'Cycle', 'TypeStd'])
+        if not {'StepNo', 'Cycle', 'TypeStd'}.issubset(table.columns):
+            return []
+        matched = table['StepNo'].astype(str).isin(wanted)
+        if direction:
+            matched &= table['TypeStd'].eq(direction.upper())
+        present = set(pd.to_numeric(table.loc[matched, 'Cycle'], errors='coerce').dropna().astype(int))
+        return [cycle for cycle in channel.cycles if cycle in present]
+
+    def _raw_detail_channel(self):
+        if self.raw_scope.currentData() == 'rpt':
+            try:
+                targets = self._curve_targets(self.raw_cycles, 'rpt')
+                return targets[0][0] if len(targets) == 1 else None
+            except ValueError:
+                return None
+        return self.active_channel()
+
     def calculate_raw(self):
+        scope = self.raw_scope.currentData()
         try:
-            targets = self._curve_targets(self.raw_cycles)
+            targets = self._curve_targets(self.raw_cycles, scope)
         except ValueError as exc:
             self.show_error(str(exc))
             return
@@ -1354,7 +1390,15 @@ class StudioWindow(QMainWindow):
                     raise InterruptedError('Raw 분석 취소')
                 progress(i, len(targets), f'Raw 준비 · {channel.name}')
                 try:
-                    curves.extend(raw_curves(channel, cycles, display_budget=PREVIEW_POINTS, cancel=cancel, **kwargs))
+                    params = dict(kwargs)
+                    if scope == 'rpt':
+                        protocol = channel.metadata.get('import_rules', {}).get('rpt_protocol', {})
+                        params['step'] = params['step'] or ','.join(dict.fromkeys(
+                            protocol.get(key) for key in ('charge', 'discharge') if protocol.get(key)))
+                        cycles = self._rpt_step_cycles(channel, params['step'])
+                        if not cycles:
+                            raise ValueError('지정한 RPT Step에 곡선 데이터가 없습니다.')
+                    curves.extend(raw_curves(channel, cycles, display_budget=PREVIEW_POINTS, cancel=cancel, **params))
                 except InterruptedError:
                     raise
                 except Exception as exc:
@@ -1363,6 +1407,7 @@ class StudioWindow(QMainWindow):
         def ready(result):
             self._last_raw_result = (key, result)
             curves, errors = result
+            curves = self._label_rpt_curves(curves)
             self._color_curves(curves, prefer_cycles=True)
             self._dirty_pages.discard(2)
             self.raw.graph.set_labels(x_label, y_label)
@@ -1390,8 +1435,9 @@ class StudioWindow(QMainWindow):
             step=self.dq_step.text().strip(), include_review=self.include_review.isChecked())
 
     def calculate_derivatives(self):
+        scope = self.curve_source.currentData()
         try:
-            targets = [(channel, cycles) for channel, cycles in self._curve_targets(self.dq_cycles)
+            targets = [(channel, cycles) for channel, cycles in self._curve_targets(self.dq_cycles, scope)
                        if channel.metadata.get('import_kind') != 'other']
         except ValueError as exc:
             self.show_error(str(exc))
@@ -1406,7 +1452,19 @@ class StudioWindow(QMainWindow):
                     raise InterruptedError('미분 분석 취소')
                 progress(i, len(targets), f'미분 분석 · {channel.name}')
                 try:
-                    result.extend(cached_derivatives(channel, cycles, settings, cancel))
+                    if scope != 'rpt':
+                        result.extend(cached_derivatives(channel, cycles, settings, cancel))
+                        continue
+                    protocol = channel.metadata.get('import_rules', {}).get('rpt_protocol', {})
+                    directions = ('charge', 'discharge') if settings['direction'] == 'both' else (settings['direction'],)
+                    for direction in directions:
+                        step = settings['step'] or protocol.get(direction, '')
+                        available = self._rpt_step_cycles(channel, step, direction)
+                        if available:
+                            result.extend(cached_derivatives(channel, available,
+                                          dict(settings, step=step, direction=direction), cancel))
+                        else:
+                            result.append(dict(error=f'{channel.name}: {direction} RPT Step 데이터 없음'))
                 except InterruptedError:
                     raise
                 except Exception as exc:
@@ -1422,20 +1480,29 @@ class StudioWindow(QMainWindow):
         else:
             self._start('analysis', calculate, ready)
 
-    def render_derivatives(self, result):
-        self._dirty_pages.discard(CURVES)
+    def _label_rpt_curves(self, result):
         labels = {c.id: c for c in self.channels}
         active = self.active_channel()
-        self._derivatives = []
+        labelled = []
+        counts = {}
+        for row in result:
+            counts.setdefault(row.get('source_id'), set()).add(row.get('cycle'))
         for original in result:
             row = dict(original)
             channel = labels.get(row.get('source_id'))
             if channel and channel.metadata.get('import_kind') == 'rpt' and not row.get('error'):
                 label = checkpoint_label(channel, active)
+                if len(counts[channel.id]) > 1:
+                    label += f" · 내부 Cycle {row.get('cycle')}"
                 row['legend_label'] = label
                 row['color_cycle'] = (channel.metadata.get('rpt_link') or {}).get('cycle') or 0
                 row['name'] = f"{label} · {row.get('direction', '')}"
-            self._derivatives.append(row)
+            labelled.append(row)
+        return labelled
+
+    def render_derivatives(self, result):
+        self._dirty_pages.discard(CURVES)
+        self._derivatives = self._label_rpt_curves(result)
         valid = [c for c in self._derivatives if not c.get('error') and len(c.get('x', []))]
         for c in valid:
             c['point_kind'] = 'calculated'
@@ -1510,7 +1577,8 @@ class StudioWindow(QMainWindow):
             include_review=self.include_review.isChecked(),
             color_mode=self.color_mode.currentData(),
             metrics={str(k): v.currentData() for k, v in self.metric_widgets.items()},
-            raw=dict(cycles=self.raw_cycles.text(), direction=self.raw_direction.currentData(),
+            rpt_curve_ids=list(self._rpt_curve_ids), curve_source=self.curve_source.currentData(),
+            raw=dict(cycles=self.raw_cycles.text(), scope=self.raw_scope.currentData(), direction=self.raw_direction.currentData(),
                      step=self.raw_step.text(), x=self.raw_x.currentData(), y=self.raw_y.currentData()),
             derivative=dict(cycles=self.dq_cycles.text(), **self.derivative_settings()),
             dcr=self.dcr.state(), main_split=self.main_splitter.sizes(),
@@ -1546,6 +1614,12 @@ class StudioWindow(QMainWindow):
                     if id_ == state.get('active_channel'):
                         self.tree.setCurrentItem(child)
             raw = state.get('raw', {})
+            ids = {c.id for c in self.channels if c.metadata.get('import_kind') == 'rpt'}
+            self._rpt_curve_ids = tuple(id_ for id_ in state.get('rpt_curve_ids', []) if id_ in ids)
+            self.curve_source.setCurrentIndex(self.curve_source.findData(
+                'rpt' if self._rpt_curve_ids and state.get('curve_source') == 'rpt' else 'life'))
+            self.raw_scope.setCurrentIndex(self.raw_scope.findData(
+                'rpt' if self._rpt_curve_ids and raw.get('scope') == 'rpt' else 'life'))
             self.raw_cycles.setText(str(raw.get('cycles', '1')))
             self.raw_step.setText(str(raw.get('step', '')))
             for combo, key in [(self.raw_x, 'x'), (self.raw_y, 'y'), (self.raw_direction, 'direction')]:
@@ -1685,6 +1759,10 @@ class StudioWindow(QMainWindow):
                                         Y_Axis=graph.plot.getAxis('left').labelText))
                       for c in graph.checked_curves()]
             return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        if row == RPT:
+            return self.rpt_comparison.current_frame()
+        if row == HOME:
+            return pd.DataFrame()
         if row == 4:
             return pd.DataFrame(getattr(self.dcr, 'result_rows', [])) if self.dcr.result_valid else pd.DataFrame()
         frames = []
@@ -1759,8 +1837,9 @@ class StudioWindow(QMainWindow):
         dialog.exec()
 
     def export_raw(self):
-        channel = self.active_channel()
+        channel = self._raw_detail_channel()
         if channel is None:
+            self.show_error('Raw 데이터를 저장하려면 한 채널 또는 한 RPT 시점을 선택하세요.')
             return
         path, _ = QFileDialog.getSaveFileName(self, '활성 채널 곡선 데이터 저장', str(Path(default_output_dir()) / 'raw.csv'), 'CSV (*.csv)')
         if path:

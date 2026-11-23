@@ -309,6 +309,13 @@ class RPTComparison(QWidget):
             item.setSymbolSize(7)
             item.setSymbolBrush(curve["color"])
 
+    def current_frame(self):
+        if self.views.currentIndex() == 1:
+            return self.detail.model.frame
+        return pd.DataFrame([{"RPT 시점": self._labels[c.id],
+                             **rpt_capacity_energy(self._rows.get(c.id, []))}
+                             for c in self.selected_checkpoints()])
+
     def _export_summary(self):
         records = [{"RPT 시점": self._labels[c.id],
                     **rpt_capacity_energy(self._rows.get(c.id, []))} for c in self._sources]

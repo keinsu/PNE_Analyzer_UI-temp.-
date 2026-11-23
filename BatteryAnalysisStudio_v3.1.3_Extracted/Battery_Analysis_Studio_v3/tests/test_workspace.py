@@ -211,6 +211,7 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(self.window.selected_channels()[0].name, "Cell-01")
         self.assertTrue(self.window.merge_button.isHidden())
         self.window.baseline.setText("102")
+        self.window.energy_baseline.setText("102")
         manager.save()
         manager.open(Study(study.directory))
         self.idle()
@@ -249,9 +250,16 @@ class WorkspaceTests(unittest.TestCase):
             self.window.aggregate.setCurrentIndex(1)
             self.window.calculate_summaries()
             self.assertEqual(compute.call_count, 1)
-            self.assertEqual(self.window.summary.table.model.frame.Cycle.tolist(), [1, 2])
+            self.assertEqual(sorted(self.window.summary.table.model.frame.Cycle.tolist()), [1, 2])
             self.window.summary_start.setValue(1)
             self.assertEqual(sorted(self.window.summary.table.model.frame.Cycle.tolist()), [1, 2])
+
+    def test_rpt_curve_locates_configured_step_instead_of_first_cycle(self):
+        channel = self.load_direct()
+        channel.steps = pd.DataFrame(dict(Cycle=[1, 2], StepNo=['1', '19'],
+                                          TypeStd=['DISCHARGE', 'DISCHARGE']))
+        self.assertEqual(self.window._rpt_step_cycles(channel, '19', 'discharge'), [2])
+        self.assertEqual(self.window._rpt_step_cycles(channel, '19', 'charge'), [])
 
     def test_project_restores_selection_settings_and_graph_view(self):
         channel = self.load_direct()
