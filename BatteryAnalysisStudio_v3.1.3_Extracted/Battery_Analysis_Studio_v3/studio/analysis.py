@@ -247,7 +247,8 @@ def prepare_cycle_tables(channel, include_review, cache_dir, cancel=None):
     return result
 
 
-def apply_cycle_baseline(base, channel_name, baseline_cycle=None, *, first_cycle=None):
+def apply_cycle_baseline(base, channel_name, baseline_cycle=None, *, first_cycle=None,
+                         independent_energy=False, energy_baseline_cycle=None):
     warnings = list(base.attrs.get("warnings", []))
     summary = base.copy()
     if "Discharge_Capacity_mAh" not in summary:
@@ -272,12 +273,27 @@ def apply_cycle_baseline(base, channel_name, baseline_cycle=None, *, first_cycle
         ref_energy = baseline["Discharge_Energy_mWh"].iloc[0] if "Discharge_Energy_mWh" in baseline else np.nan
         basis = int(baseline["Cycle"].iloc[0])
     summary["Discharge_Capacity_Retention_pct"] = summary["Discharge_Capacity_mAh"] / reference * 100
-    energies = summary.get("Discharge_Energy_mWh", pd.Series(np.nan, index=summary.index))
+    energies = pd.to_numeric(summary.get("Discharge_Energy_mWh", pd.Series(np.nan, index=summary.index)), errors="coerce")
+    energy_basis = basis if _positive_number(ref_energy) else None
+    if independent_energy:
+        eligible = np.isfinite(energies) & (energies > 0)
+        if energy_baseline_cycle is not None:
+            eligible &= summary["Cycle"].eq(energy_baseline_cycle)
+        elif first_cycle is not None:
+            eligible &= summary["Cycle"].ge(first_cycle)
+        candidates = summary.loc[eligible, "Cycle"]
+        if candidates.empty:
+            ref_energy, energy_basis = np.nan, None
+            warnings.append("유효한 방전에너지 기준 Cycle이 없습니다.")
+        else:
+            energy_basis = int(candidates.iloc[0])
+            ref_energy = energies.loc[eligible].iloc[0]
+    summary["Energy_Baseline_Cycle"] = energy_basis
     summary["Discharge_Energy_Retention_pct"] = energies / ref_energy * 100 if _positive_number(ref_energy) else np.nan
     summary["Energy_Retention_pct"] = summary["Discharge_Energy_Retention_pct"]
     summary["Baseline_Cycle"] = basis
     summary["Analysis_Version"] = ANALYSIS_VERSION
-    summary.attrs.update(warnings=warnings, baseline_cycle=basis)
+    summary.attrs.update(warnings=warnings, baseline_cycle=basis, energy_baseline_cycle=energy_basis)
     return summary
 
 
@@ -587,8 +603,10 @@ def merge_same_cell(channels: list, offsets: list[int], name: str = "연결 시�
                 d["TotalTime_s"] = t - float(valid.iloc[0]) + time_cursor
                 time_cursor = float(d["TotalTime_s"].max())
         frames.append(d)
-        if not channel.steps.empty:
-            s = channel.steps.copy(deep=True)
+        from .compact_data import read_step_table
+        step_table = read_step_table(channel)
+        if not step_table.empty:
+            s = step_table.copy(deep=True)
             if "OriginalSource_ID" not in s:
                 s["OriginalSource_ID"] = channel.id
             s["MergedComponent_ID"] = channel.id

@@ -8,10 +8,10 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout,
                                QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget,
                                QListWidgetItem, QMessageBox, QPushButton, QSpinBox, QTableWidget,
-                               QTableWidgetItem, QVBoxLayout)
+                               QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .ingestion import load_inputs
-from .studies import Study, _now
+from .studies import Study, _cell_label, _now
 from .import_dialog import classify_channels
 
 
@@ -113,7 +113,6 @@ class StudyWorkspace:
 
     def _display(self, state=None, *, reopening=False):
         state = deepcopy(state if state is not None else self.host.ui_state())
-        state["page"] = 0
         if not reopening:
             state["graphs"] = {}
         self.host.show_study_channels(self.study.channels(), state)
@@ -138,143 +137,144 @@ class StudyWorkspace:
                 return
             cycle = [c for c in configured if c.metadata["import_kind"] == "cycle"]
             auxiliary = [c for c in configured if c.metadata["import_kind"] != "cycle"]
-            if cycle:
-                self._map(study, cycle, target, auxiliary)
-            else:
-                self._prepare_import(study, [], auxiliary)
+            self._map(study, cycle, target, auxiliary)
 
         self.host._start("study", lambda progress, cancel: load_inputs(
             paths, progress, cancel, csv_options=csv_options), ready)
 
-    def _link_rpt(self, study, channels):
-        rpt = [channel for channel in channels if channel.metadata.get("import_kind") == "rpt"]
-        if not rpt:
-            return channels
-        cells = study.data["cells"]
-        if not cells:
-            QMessageBox.warning(self.host, "RPT 연결", "수명시험 셀을 먼저 등록한 다음 RPT를 추가하세요.")
-            return None
-        dialog = QDialog(self.host)
-        dialog.setWindowTitle("RPT 측정 시점과 셀 연결")
-        layout = QVBoxLayout(dialog)
-        grid = QTableWidget(len(rpt), 3)
-        grid.setHorizontalHeaderLabels(["RPT 채널", "수명시험 셀 / 관리 ID", "측정 시점 Cycle"])
-        grid.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        layout.addWidget(grid)
-        inputs = []
-        for i, channel in enumerate(rpt):
-            grid.setItem(i, 0, QTableWidgetItem(channel.name))
-            cell = QComboBox()
-            cell.addItem("직접 선택", None)
-            for entry in cells:
-                cell.addItem(f"{entry['name']} · {entry.get('management_id', entry['name'])}", entry["id"])
-            cycle = QSpinBox()
-            cycle.setRange(0, 100_000_000)
-            cycle.setSpecialValueText("직접 입력")
-            old = next((record.get("rpt_link", {}) for record in study.data["rpt"]
-                        if record.get("id") == channel.id), {})
-            if old:
-                cell.setCurrentIndex(max(0, cell.findData(old["cell_id"])))
-                cycle.setValue(old["cycle"])
-            grid.setCellWidget(i, 1, cell)
-            grid.setCellWidget(i, 2, cycle)
-            inputs.append((channel, cell, cycle))
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        layout.addWidget(buttons)
-
-        def confirm():
-            if any(cell.currentData() is None or cycle.value() < 1 for _, cell, cycle in inputs):
-                QMessageBox.warning(dialog, "RPT 연결", "모든 RPT 채널의 셀과 측정 시점 Cycle을 지정하세요.")
-                return
-            dialog.accept()
-
-        buttons.accepted.connect(confirm)
-        buttons.rejected.connect(dialog.reject)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return None
-        links = {channel.id: dict(cell_id=cell.currentData(), cycle=cycle.value())
-                 for channel, cell, cycle in inputs}
-        return [replace(c, metadata=dict(c.metadata, rpt_link=links[c.id])) if c.id in links else c
-                for c in channels]
-
     def _prepare_import(self, study, selection, auxiliary):
-        auxiliary = self._link_rpt(study, auxiliary)
-        if auxiliary is None:
-            return
         self.host._start("study", lambda progress, cancel: study.preview_cycles(selection, cancel, auxiliary),
                          lambda result: self._confirm(study, result))
 
     def _map(self, study, channels, target, auxiliary=()):
+        rpt = [channel for channel in auxiliary if channel.metadata.get("import_kind") == "rpt"]
+        other = [channel for channel in auxiliary if channel.metadata.get("import_kind") != "rpt"]
+        if not channels and not rpt:
+            if other:
+                self._prepare_import(study, [], other)
+            return
         dialog = QDialog(self.host)
-        dialog.setWindowTitle("원본 채널을 셀에 연결")
-        dialog.resize(1000, 510)
+        dialog.setWindowTitle("데이터를 셀에 등록")
+        dialog.resize(1080, 470)
         layout = QVBoxLayout(dialog)
-        layout.addWidget(QLabel("새 구간의 누적 시작 Cycle을 직접 입력하세요. 기존 구간을 갱신하면 저장된 시작 번호를 사용합니다."))
-        grid = QTableWidget(len(channels), 6)
-        grid.setHorizontalHeaderLabels(["원본 채널 / Cycle", "연결 대상", "새 셀 이름", "관리 ID", "누적 시작", "누적 범위"])
+        layout.addWidget(QLabel("측정 채널별로 관리 ID를 연결하고 수명 시작 또는 RPT 측정 시점을 지정하세요."))
+        mapped = [(channel, False) for channel in channels] + [(channel, True) for channel in rpt]
+        grid = QTableWidget(len(mapped), 5)
+        grid.setHorizontalHeaderLabels(["측정 채널", "연결 대상", "새 관리 ID", "새 셀 이름", "등록 시점"])
         grid.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        grid.verticalHeader().setDefaultSectionSize(42)
         layout.addWidget(grid)
         rows = []
-        for i, channel in enumerate(channels):
-            cycles = channel.cycles
-            source = QTableWidgetItem(f"{channel.name} · {cycles[0]}–{cycles[-1]}" if cycles else channel.name)
+        for i, (channel, is_rpt) in enumerate(mapped):
+            suffix = "RPT" if is_rpt else "수명"
+            source = QTableWidgetItem(f"{channel.name} · {suffix}")
             source.setFlags(source.flags() & ~Qt.ItemFlag.ItemIsEditable)
             grid.setItem(i, 0, source)
             mapping = QComboBox()
-            mapping.addItem("제외 / 대상을 선택하세요", None)
-            mapping.addItem("새 셀에 추가", ("", None, None))
+            mapping.addItem("선택 · 등록 보류", None)
+            mapping.addItem("새 셀 등록", ("", None, None))
             for cell in study.data["cells"]:
-                mapping.addItem(cell["name"] + " · 새 구간", (cell["id"], None, None))
-                for segment in cell["segments"]:
-                    mapping.addItem(f"{cell['name']} · {segment['start']}–{segment['end']} 갱신",
-                                    (cell["id"], segment["id"], segment["start"]))
-            name = QLineEdit(f"Cell-{len(study.data['cells']) + i + 1:02d}")
-            management_id = QLineEdit(name.text())
+                label = _cell_label(cell)
+                mapping.addItem(label if is_rpt else f"{label} · 새 구간", (cell["id"], None, None))
+                if not is_rpt:
+                    for segment in cell["segments"]:
+                        mapping.addItem(f"{label} · {segment['start']}–{segment['end']} 갱신",
+                                        (cell["id"], segment["id"], segment["start"]))
+            identifier = QLineEdit()
+            identifier.setPlaceholderText("예: Cell-01")
+            name = QLineEdit()
+            name.setPlaceholderText("비워 두면 관리 ID 사용")
             start = QSpinBox()
-            start.setRange(-1, 100_000_000)
-            start.setSpecialValueText("직접 입력")
-            start.setValue(-1)
-            preview = QLabel()
-            for col, widget in enumerate((mapping, name, management_id, start, preview), 1):
+            start.setRange(0, 100_000_000)
+            start.setSpecialValueText("측정 Cycle" if is_rpt else "누적 시작")
+            placement = QWidget()
+            placement_layout = QHBoxLayout(placement)
+            placement_layout.setContentsMargins(0, 0, 0, 0)
+            stage = QComboBox()
+            stage.addItem("시점 선택", None)
+            stage.addItem("BOL", "bol")
+            stage.addItem("측정 Cycle", "checkpoint")
+            if is_rpt:
+                placement_layout.addWidget(stage)
+            placement_layout.addWidget(start)
+            for col, widget in enumerate((mapping, identifier, name, placement), 1):
                 grid.setCellWidget(i, col, widget)
 
-            def display(*_, combo=mapping, edit=name, identifier=management_id, number=start, label=preview, source_cycles=cycles):
+            def display(*_, combo=mapping, management=identifier, edit=name, number=start,
+                        timing=stage, rpt_row=is_rpt):
                 pick = combo.currentData()
-                edit.setEnabled(pick is not None and not pick[0])
-                identifier.setEnabled(edit.isEnabled())
-                number.setEnabled(pick is not None and pick[1] is None)
-                effective = (pick[2] if pick[1] else number.value()) if pick else -1
-                label.setText(f"{effective}–{effective + source_cycles[-1] - source_cycles[0]}"
-                              if effective >= 0 and source_cycles else "—")
+                new_cell = pick is not None and not pick[0]
+                management.setEnabled(new_cell)
+                edit.setEnabled(new_cell)
+                timing.setEnabled(pick is not None)
+                if rpt_row:
+                    number.setVisible(timing.currentData() == "checkpoint")
+                    number.setEnabled(pick is not None)
+                else:
+                    number.setEnabled(pick is not None and pick[1] is None)
+                    if pick and pick[1] is not None:
+                        number.setValue(pick[2])
             mapping.currentIndexChanged.connect(display)
-            start.valueChanged.connect(display)
-            if target and cycles and len(channels) == 1:
-                for index in range(mapping.count()):
-                    value = mapping.itemData(index)
-                    if value and value[:2] == target:
-                        mapping.setCurrentIndex(index)
+            stage.currentIndexChanged.connect(display)
+
+            old = next((record.get("rpt_link", {}) for record in study.data["rpt"]
+                        if is_rpt and record.get("id") == channel.id), {})
+            wanted = (old["cell_id"], None) if old else target if not is_rpt and len(channels) == 1 else None
+            if wanted:
+                for option in range(mapping.count()):
+                    value = mapping.itemData(option)
+                    if value and value[:2] == wanted:
+                        mapping.setCurrentIndex(option)
                         break
+            if old:
+                stage.setCurrentIndex(stage.findData(old.get("stage", "checkpoint")))
+                start.setValue(old["cycle"])
+            if not study.data["cells"] and not wanted:
+                mapping.setCurrentIndex(1)
             display()
-            rows.append((channel, mapping, name, start, management_id))
+            rows.append((channel, is_rpt, mapping, name, identifier, stage, start))
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         layout.addWidget(buttons)
-        selection = []
+        selections, linked_rpt = [], []
 
-        def accept():
-            for channel, mapping, name, start, management_id in rows:
-                value = mapping.currentData()
-                if value and (not channel.cycles or (not value[1] and start.value() < 0)
-                              or (not value[0] and not management_id.text().strip())):
-                    QMessageBox.warning(dialog, "연결 확인", "Cycle이 있는 채널을 선택하고 누적 시작 Cycle과 새 셀의 관리 ID를 입력하세요.")
+        def confirm():
+            life, rpt_imports = [], []
+            for channel, rpt_row, mapping, name, identifier, stage, start in rows:
+                pick = mapping.currentData()
+                if pick is None:
+                    continue
+                cell_id, segment_id, fixed_start = pick
+                management_id = identifier.text().strip()
+                cell_name = name.text().strip() or management_id
+                if not cell_id and not management_id:
+                    QMessageBox.warning(dialog, "관리 ID", f"{channel.name}: 새 셀의 관리 ID를 입력하세요.")
                     return
-            selection[:] = [(c, m.currentData()[0], n.text(), s.value(), m.currentData()[1], identifier.text())
-                            for c, m, n, s, identifier in rows if m.currentData()]
+                if rpt_row:
+                    timing = stage.currentData()
+                    if timing is None or (timing == "checkpoint" and not start.value()):
+                        QMessageBox.warning(dialog, "RPT 시점", f"{channel.name}: BOL 또는 측정 Cycle을 지정하세요.")
+                        return
+                    link = dict(cell_id=cell_id, stage=timing, cycle=0 if timing == "bol" else start.value())
+                    if not cell_id:
+                        link.update(cell_name=cell_name, management_id=management_id)
+                    rpt_imports.append(replace(channel, metadata=dict(channel.metadata, rpt_link=link)))
+                else:
+                    effective_start = fixed_start if segment_id else start.value()
+                    if not channel.cycles or (not segment_id and not effective_start):
+                        QMessageBox.warning(dialog, "수명 구간", f"{channel.name}: 누적 시작 Cycle을 지정하세요.")
+                        return
+                    life.append((channel, cell_id, cell_name, effective_start, segment_id, management_id))
+            if not (life or rpt_imports or other):
+                QMessageBox.warning(dialog, "데이터 등록", "등록할 채널과 연결 대상을 선택하세요.")
+                return
+            selections[:] = life
+            linked_rpt[:] = rpt_imports
             dialog.accept()
 
-        buttons.accepted.connect(accept)
+        buttons.accepted.connect(confirm)
         buttons.rejected.connect(dialog.reject)
-        if dialog.exec() == QDialog.DialogCode.Accepted and (selection or auxiliary):
-            self._prepare_import(study, selection, auxiliary)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._prepare_import(study, selections, [*linked_rpt, *other])
 
     def _confirm(self, study, result):
         candidate, messages, changed = result
@@ -291,9 +291,11 @@ class StudyWorkspace:
         dialog.setDefaultButton(QMessageBox.StandardButton.No if changed else QMessageBox.StandardButton.Ok)
         if changed and dialog.exec() == QMessageBox.StandardButton.Yes:
             state = self.host.ui_state()
-            existing_ids = {row.get("id") for row in study.data["cells"] + study.data["rpt"]}
-            state["selected_channels"].extend(row["id"] for row in candidate["cells"] + candidate["rpt"]
-                                               if row.get("id") not in existing_ids and row.get("id"))
+            existing_ids = {cell["id"] for cell in study.data["cells"]}
+            new_ids = [cell["id"] for cell in candidate["cells"] if cell["id"] not in existing_ids]
+            if not state.get("active_channel") and new_ids:
+                state["active_channel"] = new_ids[0]
+                state["selected_channels"] = [new_ids[0]]
             candidate["settings"] = state
             study.commit(candidate)
             self._display(state)
@@ -308,20 +310,51 @@ class StudyWorkspace:
         dialog.resize(720, 520)
         dialog.setWindowTitle(study.data["name"] + " · 시험 이력")
         layout = QVBoxLayout(dialog)
+        picker = QComboBox()
+        active = self.host.active_channel()
+        active_id = active.metadata.get("rpt_link", {}).get("cell_id", active.id) if active else None
+        cells = study.data["cells"]
+        for cell in cells:
+            picker.addItem(_cell_label(cell), cell["id"])
+        unlinked = [record for record in study.data["rpt"] if not record.get("rpt_link", {}).get("cell_id")]
+        if unlinked:
+            picker.addItem("미연결 기록", None)
+        layout.addWidget(picker)
+        reference_label = QLabel()
+        layout.addWidget(reference_label)
         items = QListWidget()
         layout.addWidget(items)
-        for cell in study.data["cells"]:
-            for segment in cell["segments"]:
-                row = QListWidgetItem(f"{cell['name']}  ·  {segment['start']}–{segment['end']} Cycle  ·  {segment['channel']}")
-                row.setToolTip(segment["source"] + "\n마지막 Cycle 완료 여부 미확인")
-                row.setData(Qt.ItemDataRole.UserRole, (cell["id"], segment["id"]))
+
+        def display():
+            items.clear()
+            cell_id = picker.currentData()
+            if cell_id is None:
+                reference_label.hide()
+                for record in unlinked:
+                    label = "기타" if record.get("kind") == "other" else "RPT"
+                    row = QListWidgetItem(f"{label} · {record['name']}")
+                    row.setToolTip(record["path"])
+                    row.setData(Qt.ItemDataRole.UserRole, ("rpt", record.get("id", record["sha256"])))
+                    items.addItem(row)
+                return
+            cell = next(c for c in cells if c["id"] == cell_id)
+            source_id = cell.get("bol_reference_id") or cell_id
+            reference = next((c for c in cells if c["id"] == source_id), None)
+            reference_label.show()
+            reference_label.setText(f"기준 BOL · {_cell_label(reference)}" if reference and study.bol_records(source_id)
+                                    else "기준 BOL 미등록")
+            for event in study.timeline(cell_id):
+                row = QListWidgetItem(f"{event['label']} · {event['channel']}")
+                row.setToolTip(event["source"])
+                target = cell_id if event["kind"] == "life" else "rpt"
+                row.setData(Qt.ItemDataRole.UserRole, (target, event["record_id"]))
                 items.addItem(row)
-        for rpt in study.data["rpt"]:
-            label = "기타" if rpt.get("kind") == "other" else "RPT"
-            row = QListWidgetItem(label + "  ·  " + rpt["name"])
-            row.setToolTip(rpt["path"])
-            row.setData(Qt.ItemDataRole.UserRole, ("rpt", rpt.get("id", rpt["sha256"])))
-            items.addItem(row)
+            if items.count():
+                items.setCurrentRow(0)
+
+        picker.currentIndexChanged.connect(display)
+        picker.setCurrentIndex(max(0, picker.findData(active_id)))
+        display()
         bar = QHBoxLayout()
         layout.addLayout(bar)
 
@@ -392,6 +425,26 @@ class StudyWorkspace:
             dialog.accept()
             self._display()
 
+        def change_reference():
+            cell_id = picker.currentData()
+            if cell_id is None:
+                return
+            options = [("자체 BOL 사용", None)] + [(_cell_label(c), c["id"]) for c in cells
+                       if c["id"] != cell_id and study.bol_records(c["id"])]
+            current = next(c for c in cells if c["id"] == cell_id).get("bol_reference_id")
+            index = next((i for i, (_, item_id) in enumerate(options) if current == item_id), 0)
+            names = dict(options)
+            label, ok = QInputDialog.getItem(dialog, "기준 BOL 선택", "기준 셀", list(names), index, False)
+            if ok:
+                try:
+                    study.set_bol_reference(cell_id, names[label])
+                except (OSError, ValueError) as exc:
+                    QMessageBox.warning(dialog, "기준 BOL", str(exc))
+                    return
+                dialog.accept()
+                self._display()
+
+        _button(bar, "기준 BOL 선택…", change_reference)
         _button(bar, "최신 파일로 갱신", update)
         _button(bar, "기록 제외", remove)
         _button(bar, "다른 셀로 이동", move)

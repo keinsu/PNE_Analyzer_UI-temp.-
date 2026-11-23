@@ -1,5 +1,6 @@
 """Build the shared curve data and fixed DCR snapshots from a source import."""
 from dataclasses import replace
+from functools import cached_property
 import json
 from pathlib import Path
 import uuid
@@ -133,20 +134,74 @@ class CompactStore(RawStore):
             table.attrs.update(cached[2].get(name, {}))
         return tables
 
-    def rpt_rows(self):
+    def _read_channel_manifest(self):
+        from .ingestion import PROFILE_VERSION
+
+        try:
+            manifest = json.loads((self.path / "channel.json").read_text(encoding="utf-8"))
+            if manifest["version"] != PROFILE_VERSION:
+                raise ValueError("지원하지 않는 저장 형식입니다.")
+            return manifest
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError("프로젝트 채널 정보를 읽을 수 없습니다.") from exc
+
+    @cached_property
+    def _channel_info(self):
+        manifest = self._read_channel_manifest()
+        try:
+            return manifest["metadata"]["metadata"], manifest["warnings"]
+        except (KeyError, TypeError) as exc:
+            raise ValueError("프로젝트 채널 정보를 읽을 수 없습니다.") from exc
+
+    def channel_metadata(self):
+        """Read metadata without unpacking the diagnostic Step table."""
+        return self._channel_info
+
+    @cached_property
+    def _step_table(self):
         from .ingestion import _cache_read
+
         cached = _cache_read(self.path, "channel")
-        return cached[2].get("rpt_rows", []) if cached else []
+        return cached[1] if cached is not None else pd.DataFrame()
+
+    def steps(self):
+        return self._step_table
+
+    def _result(self, filename, legacy_key, default=None):
+        try:
+            return json.loads((self.path / filename).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return self._read_channel_manifest()["metadata"].get(legacy_key, default)
+        except (OSError, ValueError) as exc:
+            raise ValueError("프로젝트 분석 결과를 읽을 수 없습니다.") from exc
+
+    def rpt_rows(self):
+        try:
+            return self._result("rpt.json", "rpt_rows", [])
+        except ValueError:
+            return []
 
     def dcr(self, review):
-        from .ingestion import _cache_read
-        cached = _cache_read(self.path, "channel")
-        if cached is None:
+        detection = self._result("dcr.json", "fixed_dcr")
+        if detection is None:
             raise ValueError("프로젝트 DCR 데이터를 읽을 수 없습니다.")
-        return cached[2]["fixed_dcr"][str(int(review))]
+        return detection[str(int(review))]
 
 
-def prepare_channel(channel, root, cancel=None, *, components=()):
+def read_step_table(channel):
+    """Resolve the diagnostic table only on explicit use."""
+    table = getattr(channel, "steps", None)
+    if isinstance(table, pd.DataFrame) and not table.empty:
+        return table
+    frame = getattr(channel, "frame", None)
+    for name in ("steps", "step_table"):
+        read = getattr(frame, name, None)
+        if callable(read):
+            return read()
+    return table if table is not None else pd.DataFrame()
+
+
+def prepare_channel(channel, root, cancel=None, *, components=(), cycle_tables=None):
     from .ingestion import _cache_read, _cache_write
     from .import_rules import rpt_rows
     root = Path(root)
@@ -156,9 +211,11 @@ def prepare_channel(channel, root, cancel=None, *, components=()):
     version = "-rpt-energy-v1-compact-v2" if kind == "rpt" else "-compact-v2"
     path = root / (channel.fingerprint + version)
     try:
-        cached = _cache_read(path, "channel")
-        if cached is not None:
-            return replace(channel, frame=CompactStore(path), metadata=cached[2]["metadata"], warnings=cached[3])
+        store = CompactStore(path)
+        metadata, warnings = store.channel_metadata()
+        if not (path / "channel.npz").is_file():
+            raise ValueError("프로젝트 Step 저장소를 읽을 수 없습니다.")
+        return replace(channel, frame=store, metadata=dict(metadata), warnings=list(warnings))
     except (OSError, ValueError, KeyError):
         pass
     staged = root / (path.name + "-" + uuid.uuid4().hex)
@@ -169,7 +226,7 @@ def prepare_channel(channel, root, cancel=None, *, components=()):
         extracted = []
         if kind == "rpt":
             rules = channel.metadata["import_rules"]
-            extracted = rpt_rows(channel, rules["rpt"], cancel)
+            extracted = rpt_rows(channel, rules["rpt"], cancel) if rules["rpt"] else []
             protocol = rules.get("rpt_protocol", {})
             if protocol.get("charge"):
                 standard_rules = [
@@ -197,8 +254,14 @@ def prepare_channel(channel, root, cancel=None, *, components=()):
                 fixed_dcr[label] = merge_dcr([(part.frame.dcr(review), offset, part.id) for part, offset in components]) if components else _dcr_snapshot(channel, review, cancel)
                 if kind == "rpt":
                     tables = {"representative": pd.DataFrame(), "step_sum": pd.DataFrame()}
+                elif cycle_tables is not None:
+                    tables = cycle_tables.get(review)
+                    if tables is None:
+                        tables = cycle_tables[False]
+                elif components:
+                    tables = _merge_tables(components, review)
                 else:
-                    tables = _merge_tables(components, review) if components else cycle_aggregates(channel, review, cancel=cancel, allow_empty=True)
+                    tables = cycle_aggregates(channel, review, cancel=cancel, allow_empty=True)
             else:
                 fixed_dcr[label] = fixed_dcr["0"]
             _cache_write(staged, f"summary-{label}", (tables["representative"], tables["step_sum"],
@@ -213,10 +276,12 @@ def prepare_channel(channel, root, cancel=None, *, components=()):
             raise OSError("Cycle 요약을 저장할 수 없습니다.")
         metadata = dict(channel.metadata, compact_curves=True, disk_backed=True, original_rows=channel.row_count,
                         parse_fingerprint=channel.fingerprint + version)
-        _cache_write(data, "channel", (pd.DataFrame(), channel.steps,
-                                     {"metadata": metadata, "fixed_dcr": fixed_dcr, "rpt_rows": extracted}, channel.warnings), cancel)
-        if _cache_read(data, "channel") is None:
+        _cache_write(data, "channel", (pd.DataFrame(), read_step_table(channel),
+                                     {"metadata": metadata}, channel.warnings), cancel)
+        if not all((data / name).is_file() for name in ("channel.json", "channel.npz")):
             raise OSError("축소 프로젝트 정보를 저장할 수 없습니다.")
+        for name, result in (("dcr.json", fixed_dcr), ("rpt.json", extracted)):
+            (data / name).write_text(json.dumps(result, ensure_ascii=False, allow_nan=False), encoding="utf-8")
         try:
             data.rename(path)
         except OSError:

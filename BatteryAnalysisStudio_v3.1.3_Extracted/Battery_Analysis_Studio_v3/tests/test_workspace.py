@@ -107,7 +107,7 @@ class WorkspaceTests(unittest.TestCase):
         channel = self.window.channels[0]
         self.assertTrue(channel.metadata['disk_backed'])
         self.assertIn(channel.id, self.window._summaries)
-        self.assertEqual(self.window.summary.table.model.rowCount(), 1)
+        self.assertEqual(self.window.summary.table.model.rowCount(), 2)
         self.assertEqual(len(self.window.summary.graph.curves), 1)
         self.assertIn("2", self.window.cards[3].text())
         self.window._restoring = True
@@ -129,8 +129,13 @@ class WorkspaceTests(unittest.TestCase):
         self.window.calculate_derivatives()
         self.idle()
         self.assertEqual(len(self.window.dq_plot.curves), 4)
+        self.assertFalse(self.window.vq_plot.curves)
+        self.assertFalse(self.window.dvdq_plot.curves)
+        self.window.dq_tabs.setCurrentIndex(1)
         self.assertEqual(len(self.window.vq_plot.curves), 4)
+        self.window.dq_tabs.setCurrentIndex(2)
         self.assertEqual(len(self.window.dvdq_plot.curves), 4)
+        self.window.dq_tabs.setCurrentIndex(0)
         self.assertEqual(self.window.dq_plot.list.count(), 2)
         self.assertEqual(self.window.dq_plot.list.item(0).foreground().color(),
                          self.window.raw.graph.list.item(0).foreground().color())
@@ -193,10 +198,15 @@ class WorkspaceTests(unittest.TestCase):
         with patch("studio.study_ui.QMessageBox.exec", return_value=QMessageBox.StandardButton.Yes):
             manager._confirm(study, preview)
         self.idle()
+        self.window.nav.setCurrentRow(0)
+        self.idle()
         self.window.summary_start.setValue(101)
-        self.assertEqual(self.window.summary.graph.curves[0]["x"].tolist(), [1, 2])
+        self.assertEqual(self.window.summary.graph.curves[0]["x"].tolist(), [101, 102])
+        self.window.relative_cycles.setChecked(True)
         self.window.summary_start.setValue(102)
         self.assertEqual(self.window.summary.graph.curves[0]["x"].tolist(), [1])
+        self.window.nav.setCurrentRow(1)
+        self.idle()
         self.assertEqual(self.window.life.table.model.frame["Cycle"].tolist(), [1])
         self.assertEqual(self.window.selected_channels()[0].name, "Cell-01")
         self.assertTrue(self.window.merge_button.isHidden())
@@ -211,13 +221,16 @@ class WorkspaceTests(unittest.TestCase):
         channel = self.load_direct()
         self.window.baseline.setText("2")
         self.window._summaries = {channel.id: cycle_summary(channel, baseline_cycle=2)}
+        self.window.nav.setCurrentRow(1)
+        self.idle()
+        self.window.full_summary.setChecked(True)
         combo = self.window.metric_widgets[1]
         combo.setCurrentIndex(combo.findData("Energy_Retention_pct"))
         self.window.render_summaries()
         self.assertEqual(combo.currentData(), "Energy_Retention_pct")
         table = self.window.life.table.model.frame
         self.assertEqual(table.Source_ID.nunique(), 1)
-        self.assertEqual(table.loc[table.Cycle == 1, "Energy_Retention_pct"].iloc[0], 100.)
+        self.assertEqual(table.loc[table.Cycle == 2, "Energy_Retention_pct"].iloc[0], 100.)
         self.assertIn("2", self.window.cards[3].text())
 
     def test_summary_reuses_same_setting_cache(self):
@@ -232,11 +245,11 @@ class WorkspaceTests(unittest.TestCase):
             self.window.calculate_summaries()
             self.idle()
             self.assertEqual(compute.call_count, 1)
-            self.assertIn("1", self.window.cards[3].text())
+            self.assertIn("2", self.window.cards[3].text())
             self.window.aggregate.setCurrentIndex(1)
             self.window.calculate_summaries()
             self.assertEqual(compute.call_count, 1)
-            self.assertEqual(self.window.summary.table.model.frame.Cycle.tolist(), [1])
+            self.assertEqual(self.window.summary.table.model.frame.Cycle.tolist(), [1, 2])
             self.window.summary_start.setValue(1)
             self.assertEqual(sorted(self.window.summary.table.model.frame.Cycle.tolist()), [1, 2])
 

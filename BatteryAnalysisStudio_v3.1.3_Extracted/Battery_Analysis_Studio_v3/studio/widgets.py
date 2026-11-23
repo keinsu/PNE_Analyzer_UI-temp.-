@@ -27,6 +27,8 @@ HEADERS = {'Channel': '채널', 'Cycle': 'Cycle', 'OriginalCycle': '원본 Cycle
     'Discharge_Capacity_Retention_pct': '용량 유지율 (%)', 'Discharge_Energy_mWh': '방전에너지 (mWh)',
     'Energy_Retention_pct': '에너지 유지율 (%)', 'Coulombic_Efficiency_pct': 'CE (%)',
     'Energy_Efficiency_pct': 'EE (%)', 'Avg_Temp_C': '평균 온도 (°C)', 'Max_Temp_C': '최대 온도 (°C)',
+    'Energy_Baseline_Cycle': '에너지 기준 Cycle', 'Source_Cycle': '누적 Cycle',
+    'Discharge_Energy_mWh': '방전에너지 (mWh)', 'Energy_Retention_pct': '에너지 유지율 (%)',
     'Baseline_Cycle': '기준 Cycle', 'Source_ID': '원본 ID', 'Source_File': '원본 파일',
     'MatchStatus': '매칭 상태', 'StepNo': 'StepNo', 'PhysicalStepID': '물리 Step ID',
     'Voltage_V': '전압 (V)', 'Current_mA': '전류 (mA)', 'Capacity_mAh': '용량 (mAh)',
@@ -337,8 +339,8 @@ class CurvePlot(QWidget):
             self._curve_to_legend.append(legend_index)
             label = curve.get('name', f'곡선 {i + 1}')
             if group_cycles:
-                label = f"Cycle {curve['cycle']}"
-                if multi_channel:
+                label = curve.get('legend_label') or f"Cycle {curve['cycle']}"
+                if multi_channel and not curve.get('legend_label'):
                     label += f" · {curve.get('channel', '')}"
             row = QListWidgetItem(label)
             row.setToolTip(label)
@@ -601,13 +603,15 @@ class CurvePlot(QWidget):
         try:
             with open(path, 'w', newline='', encoding='utf-8-sig') as handle:
                 writer = csv.writer(handle)
-                writer.writerow(['Source_ID', 'Curve', 'Cycle', 'Step', 'Direction', 'PointKind', 'X', 'Y', 'Settings_JSON'])
+                writer.writerow(['Source_ID', 'Curve', 'Cycle', 'Step', 'Direction', 'PointKind', 'X', 'Y', 'X_Axis', 'Y_Axis', 'Settings_JSON'])
                 for i, c in enumerate(self.curves):
                     if not self.items[i].isVisible():
                         continue
+                    x_label = self.plot.getAxis('bottom').labelText
+                    y_label = self.right_label if c.get('right_axis') else self.plot.getAxis('left').labelText
                     for x, y in zip(c['x'], c['y']):
                         writer.writerow([c.get('source_id', ''), c.get('name', ''), c.get('cycle', ''),
-                                         c.get('step', ''), c.get('direction', ''), c.get('point_kind', 'calculated'), x, y,
+                                         c.get('step', ''), c.get('direction', ''), c.get('point_kind', 'calculated'), x, y, x_label, y_label,
                                          json.dumps(c.get('settings', {}), ensure_ascii=False, default=str)])
         except Exception as exc:
             QMessageBox.warning(self, '저장 실패', str(exc))

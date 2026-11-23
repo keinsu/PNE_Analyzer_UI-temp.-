@@ -26,8 +26,9 @@ from .ingestion import load_inputs
 from .analysis import apply_cycle_baseline, prepare_cycle_tables, raw_curves, track_peaks
 from .derivative_cache import cached_derivatives
 from .project import save_project, load_project, project_channels, default_output_dir
-from .compact_data import CompactStore, prepare_channel
+from .compact_data import CompactStore, prepare_channel, read_step_table
 from .measurements import dcir_changes
+from .cell_views import RPTComparison, StudyOverview, checkpoint_label, rpt_checkpoints
 from .import_dialog import classify_channels
 from .dcr_panel import DCRPanel
 from .raw_store import PREVIEW_POINTS
@@ -48,6 +49,8 @@ METRICS = {
     '충전·방전 10초 저항 (mΩ)': 'resistance_10s',
     '방전 종료 온도 (°C)': 'Discharge_End_Temp_C',
 }
+SUMMARY, LIFE, RAW, CURVES, DCR, COMPARE, EXPORT, RPT, HOME = range(9)
+
 AXES = {'Step 시간 (s)': 'StepTime_s', '누적 시간 (s)': 'TotalTime_s',
         '용량 (mAh)': 'Capacity_mAh', '전압 (V)': 'Voltage_V',
         '전류 (mA)': 'Current_mA', '에너지 (mWh)': 'Energy_mWh', '온도 (°C)': 'Temp_C'}
@@ -129,6 +132,10 @@ class StudioWindow(QMainWindow):
         self._last_raw_result = None
         self._last_derivative_result = None
         self._derivatives = []
+        self._derivative_tabs_ready = set()
+        self._rpt_curve_ids = ()
+        self._overview_context = None
+        self._rpt_context = None
         self._pending_project = None
         self._project_path = None
         self._last_input_paths = []
@@ -204,7 +211,7 @@ class StudioWindow(QMainWindow):
             buttons.addWidget(b)
         side.addLayout(buttons)
         self.search = QLineEdit()
-        self.search.setPlaceholderText('시험·채널 검색')
+        self.search.setPlaceholderText('관리 ID 또는 채널 검색')
         self.search.textChanged.connect(self.filter_tree)
         side.addWidget(self.search)
         self.tree = QTreeWidget()
@@ -213,12 +220,14 @@ class StudioWindow(QMainWindow):
         self.tree.itemChanged.connect(self._selection_changed)
         self.tree.currentItemChanged.connect(self._active_changed)
         side.addWidget(self.tree, 1)
-        checks = QHBoxLayout()
-        for label, checked in [('전체', True), ('해제', False)]:
+        self.comparison_controls = QWidget()
+        checks = QHBoxLayout(self.comparison_controls)
+        checks.setContentsMargins(0, 0, 0, 0)
+        for label, checked in [('전체 비교', True), ('비교 해제', False)]:
             b = QPushButton(label)
             b.clicked.connect(lambda _, state=checked: self.check_all(state))
             checks.addWidget(b)
-        side.addLayout(checks)
+        side.addWidget(self.comparison_controls)
         self.merge_button = QPushButton('같은 셀의 분할시험 연결…')
         self.merge_button.clicked.connect(self.merge_channels)
         side.addWidget(self.merge_button)
@@ -227,23 +236,40 @@ class StudioWindow(QMainWindow):
         self.study_details_button.hide()
         side.addWidget(self.study_details_button)
         self.nav = QListWidget()
-        self.nav.addItems(['Summary', 'Cycle Life', 'Raw Curve', 'dQ/dV · dV/dQ',
-                           'DCR / SOC', 'Channel / Cell Compare', 'Export'])
+        self.nav.addItems(['수명 Summary', 'Cycle Life', 'Raw Curve', '곡선 분석 · dQ/dV',
+                           'DCR / SOC', 'Channel / Cell Compare', '상세 내보내기', 'RPT 비교', '시험 홈'])
+        for row in (LIFE, RAW, DCR, COMPARE, EXPORT):
+            self.nav.item(row).setHidden(True)
+        self.advanced_navigation = QPushButton('상세 화면')
+        self.advanced_navigation.setCheckable(True)
+        self.advanced_navigation.toggled.connect(self._show_advanced_navigation)
+        side.addWidget(self.advanced_navigation)
         self.nav.setMaximumHeight(245)
         self.nav.currentRowChanged.connect(self.change_page)
         side.addWidget(self.nav)
         self.main_splitter.addWidget(sidebar)
         self.stack = QStackedWidget()
-        self.summary = AnalysisPage('Summary', '선택 채널의 수명 추이와 마지막 측정값입니다. 카드는 현재 활성 채널 기준입니다.')
+        self.summary = AnalysisPage('수명 Summary', '')
+        self.summary_header = QLabel('관리 ID를 선택하세요.')
+        self.summary_header.setWordWrap(True)
+        self.summary.layout().insertWidget(1, self.summary_header)
+        self.summary.table_toggle.setChecked(True)
         cardrow = QHBoxLayout()
         self.cards = []
-        for label in ['방전용량', '용량 유지율', '최대 온도', '기준 Cycle']:
+        for label in ['진행 Cycle', '방전에너지', '방전에너지 유지율', '에너지 기준 Cycle']:
             card = QLabel(label + '\n—')
             card.setStyleSheet('background:#182a32;border:1px solid #29414a;border-radius:7px;padding:12px;font-size:15px')
             card.setMinimumHeight(62)
             self.cards.append(card)
             cardrow.addWidget(card)
         self.summary.layout().insertLayout(2, cardrow)
+        self.energy_graph = CurvePlot('누적 Cycle', '방전에너지 (mWh)')
+        self.energy_graph.setMinimumHeight(185)
+        self.energy_graph.origin_btn.show()
+        self.energy_graph.origin_btn.clicked.connect(lambda: self._export_visible_origin(self.energy_graph, '방전에너지'))
+        self.energy_graph.hide()
+        self.summary.splitter.insertWidget(1, self.energy_graph)
+        self.summary.splitter.setStretchFactor(1, 2)
         self.life = AnalysisPage('Cycle Life', '기준 Cycle과 지표는 독립적으로 유지됩니다. 표의 Cycle을 선택하면 곡선을 강조합니다.')
         self.raw = AnalysisPage('Raw Curve', '범례에서 Cycle을 클릭해 강조하거나 체크를 해제해 숨길 수 있습니다.')
         self.raw_tables = QTabWidget()
@@ -279,6 +305,14 @@ class StudioWindow(QMainWindow):
         self.dq_note = QLabel('오른쪽 설정에서 Cycle·방향·보간·스무딩을 선택한 뒤 분석하세요.')
         self.dq_note.setWordWrap(True)
         dq_layout.addWidget(self.dq_note)
+        self.curve_controls = QHBoxLayout()
+        self.curve_source = QComboBox()
+        self.curve_source.addItem('수명 Cycle', 'life')
+        self.curve_source.addItem('선택한 RPT 시점', 'rpt')
+        self.curve_source.currentIndexChanged.connect(self._curve_source_changed)
+        self.curve_controls.addWidget(self.curve_source)
+        self.curve_controls.addWidget(QLabel('Cycle'))
+        dq_layout.addLayout(self.curve_controls)
         self.dq_tabs = QTabWidget()
         self.dq_plot = CurvePlot('전압 (V)', 'dQ/dV (mAh/V)')
         self.vq_plot = CurvePlot('용량 (mAh)', '전압 (V)')
@@ -294,12 +328,23 @@ class StudioWindow(QMainWindow):
                              ('피크 결과', self.peak_table), ('피크 추이', self.peak_trend)]:
             self.dq_tabs.addTab(widget, text)
         dq_layout.addWidget(self.dq_tabs, 1)
+        self.dq_tabs.currentChanged.connect(self._render_derivative_tab)
         self.dcr = DCRPanel()
         self.dcr.schedule = lambda work, ready: self._start('dcr', work, ready)
         self.dcr.cancel_scheduled = lambda: self._cancel_task('dcr')
         self.dcr.statusMessage.connect(self.statusBar().showMessage)
         self.export_page = self._build_export_page()
-        self.pages = [self.summary, self.life, self.raw, self.derivative, self.dcr, self.compare, self.export_page]
+        self.rpt_comparison = RPTComparison()
+        self.rpt_comparison.compareRequested.connect(self._compare_rpt_curves)
+        self.rpt_comparison.graph.origin_btn.show()
+        self.rpt_comparison.graph.origin_btn.clicked.connect(
+            lambda: self._export_visible_origin(self.rpt_comparison.graph, 'RPT SOC별 DCIR'))
+        self.study_home = StudyOverview()
+        self.study_home.cellRequested.connect(self._select_cell)
+        self.study_home.rptRequested.connect(lambda: self.nav.setCurrentRow(RPT))
+        self.study_home.lifeRequested.connect(lambda: self.nav.setCurrentRow(SUMMARY))
+        self.pages = [self.summary, self.life, self.raw, self.derivative, self.dcr, self.compare,
+                      self.export_page, self.rpt_comparison, self.study_home]
         for page in self.pages:
             self.stack.addWidget(page)
         self.main_splitter.addWidget(self.stack)
@@ -308,8 +353,14 @@ class StudioWindow(QMainWindow):
         outer.addWidget(self.main_splitter, 1)
         self.notice = QLabel('원본 읽기 전용 · 오프라인 분석 · 검토 필요 구간은 기본 정량분석에서 제외')
         self.notice.setWordWrap(True)
+        self.warning_details = QPushButton('검토 상세…')
+        self.warning_details.hide()
+        self.warning_details.clicked.connect(self._show_import_warnings)
         self.notice.setStyleSheet('color:#91a8b5;padding:4px')
-        outer.addWidget(self.notice)
+        status = QHBoxLayout()
+        status.addWidget(self.notice, 1)
+        status.addWidget(self.warning_details)
+        outer.addLayout(status)
         self.progress = QProgressBar()
         self.progress.setMaximumWidth(210)
         self.progress.hide()
@@ -381,13 +432,39 @@ class StudioWindow(QMainWindow):
                 combo.addItem(label, field)
             combo.currentIndexChanged.connect(self.render_summaries)
             self.metric_widgets[index] = combo
-            form.addRow('表示 지표'.replace('表示', '분석'), combo)
+            if index == SUMMARY:
+                combo.setCurrentIndex(combo.findData('Energy_Retention_pct'))
+            if index == SUMMARY:
+                controls = QHBoxLayout()
+                controls.addWidget(QLabel('분석 지표'))
+                controls.addWidget(combo)
+                csv_button = QPushButton('표 CSV 저장')
+                csv_button.clicked.connect(self.export_current_table)
+                controls.addWidget(csv_button)
+                controls.addStretch()
+                self.summary.layout().insertLayout(3, controls)
+            else:
+                form.addRow('분석 지표', combo)
             if index == 0:
                 self.summary_start = QSpinBox()
                 self.summary_start.setRange(0, 10000000)
-                self.summary_start.setValue(2)
+                self.summary_start.setValue(1)
                 self.summary_start.valueChanged.connect(self.render_summaries)
-                form.addRow('시작 Cycle (새 1)', self.summary_start)
+                form.addRow('표시 시작 누적 Cycle', self.summary_start)
+                self.relative_cycles = QCheckBox('표시 시작 Cycle을 1로 표시')
+                self.relative_cycles.toggled.connect(self.render_summaries)
+                form.addRow(self.relative_cycles)
+                self.show_dcir = QCheckBox('방전용량 유지율에 DCIR 오른쪽 축 표시')
+                self.show_dcir.toggled.connect(self.render_summaries)
+                form.addRow(self.show_dcir)
+                self.energy_baseline = QLineEdit()
+                self.energy_baseline.setPlaceholderText('자동 · 에너지가 있는 첫 Cycle')
+                self.energy_baseline.textChanged.connect(self._summary_dirty)
+                self.energy_baseline.returnPressed.connect(self.refresh_current)
+                form.addRow('방전에너지 기준 Cycle', self.energy_baseline)
+                self.full_summary = QCheckBox('상세 열 표시')
+                self.full_summary.toggled.connect(self.render_summaries)
+                form.addRow(self.full_summary)
                 reference = QPushButton('기준 DCIR 입력…')
                 reference.clicked.connect(self.edit_dcir_reference)
                 form.addRow('SOC 50% 방전 10초', reference)
@@ -413,7 +490,15 @@ class StudioWindow(QMainWindow):
         dq_settings = QWidget()
         form = QFormLayout(dq_settings)
         self.dq_cycles = QLineEdit('1')
-        self.dq_cycles.setPlaceholderText('1,5,10-50:5')
+        self.dq_cycles.setPlaceholderText('예: 1, 100, 200')
+        self.curve_controls.addWidget(self.dq_cycles)
+        curve_apply = QPushButton('곡선 적용')
+        curve_apply.clicked.connect(self.calculate_derivatives)
+        self.curve_controls.addWidget(curve_apply)
+        raw_button = QPushButton('Raw Curve')
+        raw_button.clicked.connect(self._open_raw_view)
+        self.curve_controls.addWidget(raw_button)
+        self.curve_controls.addStretch()
         self.dq_direction = QComboBox()
         for label, key in [('충전+방전', 'both'), ('충전', 'charge'), ('방전', 'discharge')]:
             self.dq_direction.addItem(label, key)
@@ -444,7 +529,7 @@ class StudioWindow(QMainWindow):
         self.dq_track_shift.setRange(.1, 500)
         self.dq_track_shift.setValue(50)
         self.dq_track_shift.setSuffix(' mV')
-        for label, widget in [('Cycle', self.dq_cycles), ('방향', self.dq_direction), ('StepNo', self.dq_step),
+        for label, widget in [('방향', self.dq_direction), ('StepNo', self.dq_step),
                               ('보간점', self.dq_points), ('스무딩', self.dq_smooth), ('윈도 (홀수)', self.dq_window),
                               ('다항식 차수', self.dq_order), ('피크 돌출도', self.dq_peak),
                               ('피크 최소 간격', self.dq_peak_distance), ('피크 추적 허용 이동', self.dq_track_shift)]:
@@ -456,7 +541,7 @@ class StudioWindow(QMainWindow):
         blank = QWidget()
         blank_layout = QVBoxLayout(blank)
         blank_layout.addWidget(QLabel('이 분석의 세부 설정은 화면 안에서 조절합니다.'))
-        self._pages[4] = self._pages[6] = self.settings_stack.addWidget(blank)
+        self._pages[DCR] = self._pages[EXPORT] = self._pages[RPT] = self._pages[HOME] = self.settings_stack.addWidget(blank)
         layout.addWidget(self.settings_stack)
         apply_button = QPushButton('현재 조건으로 분석')
         apply_button.setMinimumHeight(40)
@@ -468,6 +553,7 @@ class StudioWindow(QMainWindow):
         scroll.setWidget(host)
         self.settings_dock.setWidget(scroll)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.settings_dock)
+        self.settings_dock.hide()
         for widget in [self.dq_cycles, self.dq_step, self.raw_cycles, self.raw_step]:
             widget.textChanged.connect(self.mark_dirty)
         for widget in [self.dq_points, self.dq_window, self.dq_order, self.dq_peak, self.dq_peak_distance, self.dq_track_shift]:
@@ -477,17 +563,38 @@ class StudioWindow(QMainWindow):
         for widget in [self.raw_x, self.raw_y, self.raw_direction]:
             widget.currentIndexChanged.connect(self.mark_dirty)
 
+    def _tree_checked_ids(self):
+        return {self.tree.topLevelItem(i).child(j).data(0, Qt.ItemDataRole.UserRole)
+                for i in range(self.tree.topLevelItemCount())
+                for j in range(self.tree.topLevelItem(i).childCount())
+                if self.tree.topLevelItem(i).child(j).checkState(0) == Qt.CheckState.Checked}
+
     def selected_channels(self):
-        ids = {self.tree.topLevelItem(i).child(j).data(0, Qt.ItemDataRole.UserRole)
-               for i in range(self.tree.topLevelItemCount())
-               for j in range(self.tree.topLevelItem(i).childCount())
-               if self.tree.topLevelItem(i).child(j).checkState(0) == Qt.CheckState.Checked}
+        ids = self._tree_checked_ids()
+        item = self.tree.currentItem()
+        if self.study_workspace.study and item:
+            ids.add(item.data(0, Qt.ItemDataRole.UserRole))
         return [c for c in self.channels if c.id in ids]
 
     def active_channel(self):
         item = self.tree.currentItem()
         id_ = item.data(0, Qt.ItemDataRole.UserRole) if item else None
         return next((c for c in self.channels if c.id == id_), None) or next(iter(self.selected_channels()), None)
+
+    def _show_advanced_navigation(self, shown):
+        for row in (LIFE, RAW, DCR, COMPARE, EXPORT):
+            self.nav.item(row).setHidden(not shown)
+        if not shown and self.nav.currentRow() in (LIFE, RAW, DCR, COMPARE, EXPORT):
+            self.nav.setCurrentRow(SUMMARY)
+
+    def _select_cell(self, cell_id):
+        for i in range(self.tree.topLevelItemCount()):
+            parent = self.tree.topLevelItem(i)
+            for j in range(parent.childCount()):
+                child = parent.child(j)
+                if child.data(0, Qt.ItemDataRole.UserRole) == cell_id:
+                    self.tree.setCurrentItem(child)
+                    return
 
     def _selection_changed(self, *_):
         if not self._restoring:
@@ -497,10 +604,28 @@ class StudioWindow(QMainWindow):
     def _active_changed(self, *_):
         channel = self.active_channel()
         if channel:
-            self.dcr.set_active_channel(channel.id, auto_detect=self.nav.currentRow() == 4 and not self._restoring)
+            self.dcr.set_active_channel(channel.id, auto_detect=self.nav.currentRow() == DCR and not self._restoring)
             self.update_cards()
-            if self.nav.currentRow() == 2 and not self._restoring:
+            if self.nav.currentRow() == RAW and not self._restoring:
                 self._show_raw_tables(channel)
+        if not self._restoring and self.study_workspace.study:
+            self._selection_changed()
+
+    def _show_import_warnings(self):
+        warnings = [f'{channel.name}: {warning}' for channel in self.channels for warning in channel.warnings]
+        if warnings:
+            dialog = QMessageBox(self)
+            dialog.setWindowTitle('가져오기 검토')
+            dialog.setText(f'확인할 항목 {len(warnings):,}건')
+            dialog.setDetailedText('\n'.join(warnings))
+            dialog.exec()
+
+    def _update_import_notice(self, message):
+        count = sum(len(channel.warnings) for channel in self.channels)
+        self.warning_details.setVisible(bool(count))
+        self.notice.setText(f'{message} · 검토 {count:,}건' if count else message)
+        self.notice.setStyleSheet('color:#f2a950;padding:4px' if count else 'color:#91a8b5;padding:4px')
+        self.notice.setToolTip('')
 
     def _show_raw_tables(self, channel):
         if self.raw.table_toggle.isChecked():
@@ -521,7 +646,7 @@ class StudioWindow(QMainWindow):
         if self._raw_table_sources.get(tab) == key:
             return
         if tab == 1:
-            table, frame = self.match_table, channel.steps
+            table, frame = self.match_table, read_step_table(channel)
         else:
             start = (page - 1) * page_size
             table = self.source_table
@@ -560,7 +685,9 @@ class StudioWindow(QMainWindow):
             parent.setHidden(not visible)
 
     def _populate_tree(self):
-        selected = {c.id for c in self.selected_channels()}
+        selected = self._tree_checked_ids()
+        active = self.active_channel()
+        managed = self.study_workspace.study is not None
         previous = {self.tree.topLevelItem(i).child(j).data(0, Qt.ItemDataRole.UserRole)
                     for i in range(self.tree.topLevelItemCount())
                     for j in range(self.tree.topLevelItem(i).childCount())}
@@ -568,21 +695,26 @@ class StudioWindow(QMainWindow):
         self.tree.clear()
         groups = {}
         for c in self.channels:
-            source = str(c.source_path)
+            if managed and c.metadata.get('input_type') != 'study_cell':
+                continue
+            source = '관리 셀' if managed else str(c.source_path)
             if source not in groups:
-                parent = QTreeWidgetItem([Path(source).name])
+                parent = QTreeWidgetItem([source if managed else Path(source).name])
                 parent.setToolTip(0, source)
                 self.tree.addTopLevelItem(parent)
                 parent.setExpanded(True)
                 groups[source] = parent
             kind = c.metadata.get("import_kind", "cycle")
             title = f"{c.name} · {'RPT' if kind == 'rpt' else '기타'}" if kind != "cycle" else c.name
+            if managed:
+                identity = c.metadata.get('management_id', c.name)
+                title = f'{identity} · {c.name}' if identity != c.name else identity
             child = QTreeWidgetItem([title])
             child.setData(0, Qt.ItemDataRole.UserRole, c.id)
             child.setFlags(child.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             counts = c.metadata.get('status_counts', {})
             analyzable = any(int(counts.get(status, 0) or 0) > 0 for status in ('MATCHED', 'CSV'))
-            should_check = c.id in selected or (c.id not in previous and analyzable)
+            should_check = c.id in selected or (not managed and c.id not in previous and analyzable)
             child.setCheckState(0, Qt.CheckState.Checked if should_check else Qt.CheckState.Unchecked)
             availability = '' if analyzable else '정량분석 가능한 연결 데이터 없음\n'
             child.setToolTip(0, f'{c.row_count:,} records\n{availability}' + '\n'.join(c.warnings))
@@ -591,13 +723,17 @@ class StudioWindow(QMainWindow):
         self.dcr.set_channels(self.channels)
         if self.tree.topLevelItemCount():
             self.tree.setCurrentItem(self.tree.topLevelItem(0).child(0))
-        self.info.setText(f'{len(groups)}개 입력 · {len(self.channels)}개 채널 · {sum(c.row_count for c in self.channels):,}점')
+        if active:
+            self._select_cell(active.id)
+        self.tree.setHeaderLabel('관리 ID · 체크하여 비교' if managed else '시험 / 채널')
+        self.info.setText(f'{sum(parent.childCount() for parent in groups.values()):,}개 관리 셀' if managed
+                          else f'{len(groups)}개 입력 · {len(self.channels)}개 채널')
 
     def change_page(self, row):
         if row < 0:
             return
         self.stack.setCurrentIndex(row)
-        if row < 6:
+        if row != EXPORT:
             self._last_analysis_page = row
         if hasattr(self, 'settings_stack'):
             self.settings_stack.setCurrentIndex(self._pages[row])
@@ -620,6 +756,7 @@ class StudioWindow(QMainWindow):
         if self._restoring:
             return
         self._dirty_pages.update([0, 1, 5])
+        self.energy_graph.set_stale(True)
         for page in (self.summary, self.life, self.compare):
             page.graph.set_stale(True)
 
@@ -774,6 +911,13 @@ class StudioWindow(QMainWindow):
         self._summary_cache.clear()
         self._last_raw_result = self._last_derivative_result = None
         self._derivatives.clear()
+        self._derivative_tabs_ready.clear()
+        self._rpt_curve_ids = ()
+        self._overview_context = self._rpt_context = None
+        self.curve_source.blockSignals(True)
+        self.curve_source.setCurrentIndex(0)
+        self.curve_source.blockSignals(False)
+        self.dq_cycles.setEnabled(True)
         self._raw_table_sources.clear()
         self._dirty_pages.update([0, 1, 2, 3, 5])
         for graph in (self.raw.graph, self.dq_plot, self.vq_plot, self.dvdq_plot, self.peak_trend):
@@ -788,11 +932,7 @@ class StudioWindow(QMainWindow):
             self._restoring = False
         self.merge_button.hide()
         self.study_details_button.show()
-        warnings = [f'{c.name}: {w}' for c in channels for w in c.warnings]
-        self.notice.setText(' · '.join(warnings) if warnings else
-                            '시험을 열었습니다. ＋ 데이터에서 구간을 추가하거나 갱신하세요.')
-        self.notice.setToolTip('')
-        self.render_summaries()
+        self._update_import_notice('시험 목록에서 셀을 선택하거나 데이터를 추가하세요.')
         self.restore_state(state)
 
     def import_paths(self, paths, replace=False, csv_options=None, *, configure=False):
@@ -825,10 +965,9 @@ class StudioWindow(QMainWindow):
                 self._populate_tree()
             finally:
                 self._restoring = False
-            warnings = [f'{c.name}: {w}' for c in channels for w in c.warnings]
-            self.notice.setText(f'입력 완료 · 가져오기 안내 {len(warnings):,}건 (마우스를 올려 보기)'
-                                if warnings else '입력 완료')
-            self.notice.setToolTip('\n'.join(warnings))
+            self._overview_context = self._rpt_context = None
+            self._rpt_curve_ids = ()
+            self._update_import_notice('입력 완료')
             active = self.active_channel()
             if active and active.cycles:
                 self.raw_cycles.setText(str(active.cycles[0]))
@@ -846,9 +985,6 @@ class StudioWindow(QMainWindow):
                 self.refresh_current()
         import tempfile
         cache_dir = str(Path(tempfile.gettempdir()) / 'BatteryAnalysisStudio3' / 'cache')
-        settings = self.derivative_settings()
-        settings.pop('peak_track_shift_mv')
-
         def load(progress, cancel, configured=None):
             def prepare(channel):
                 progress(0, 1, f'곡선·요약·DCR 준비 · {channel.name}')
@@ -856,14 +992,6 @@ class StudioWindow(QMainWindow):
             channels = (load_inputs(paths, progress=progress, cancel=cancel,
                                     csv_options=csv_options, consume=prepare) if configured is None
                         else [prepare(channel) for channel in configured])
-            if channels and channels[0].cycles:
-                first = channels[0]
-                progress(0, 1, f'기본 미분 곡선 준비 · {first.name}')
-                try:
-                    cached_derivatives(first, [first.cycles[0]], settings, cancel)
-                except ValueError:
-                    # Import remains available when this selection has no usable curve.
-                    pass
             return channels
 
         if configure:
@@ -877,9 +1005,26 @@ class StudioWindow(QMainWindow):
             self._start('load', load, loaded)
 
     def refresh_current(self):
+        row = self.nav.currentRow()
+        if row == HOME:
+            study = self.study_workspace.study
+            cell = self.active_channel()
+            context = (id(study), study.data['revision'] if study else None, cell.id if cell else None)
+            if context != self._overview_context:
+                self.study_home.set_context(cell, self.channels, study)
+                self._overview_context = context
+            return
+        if row == RPT:
+            cell = self.active_channel()
+            if not self.study_workspace.study and (cell is None or cell.metadata.get('import_kind') != 'rpt'):
+                cell = next((c for c in self.channels if c.metadata.get('import_kind') == 'rpt'), None)
+            context = (cell.id if cell else None, tuple((c.id, c.fingerprint) for c in self.channels))
+            if context != self._rpt_context:
+                self.rpt_comparison.set_context(cell, self.channels)
+                self._rpt_context = context
+            return
         if not self.channels:
             return
-        row = self.nav.currentRow()
         if row in (0, 1, 5):
             self.calculate_summaries()
         elif row == 2:
@@ -900,6 +1045,12 @@ class StudioWindow(QMainWindow):
             raise ValueError('기준 Cycle은 실제 존재하는 정수로 입력하세요.')
         return int(text) if text else None
 
+    def _energy_baseline_value(self):
+        text = self.energy_baseline.text().strip()
+        if text and not text.isdigit():
+            raise ValueError('방전에너지 기준 Cycle은 정수로 입력하세요.')
+        return int(text) if text else None
+
     @staticmethod
     def _cycle_table_key(channel, review):
         counts = channel.metadata.get('status_counts')
@@ -914,22 +1065,24 @@ class StudioWindow(QMainWindow):
     def calculate_summaries(self):
         try:
             baseline = self._baseline_value()
+            energy_baseline = self._energy_baseline_value()
         except ValueError as exc:
             self.show_error(str(exc))
             return
-        channels = [c for c in self.selected_channels() if c.metadata.get("import_kind", "cycle") == "cycle"]
+        channels = [c for c in self.selected_channels() if c.metadata.get("import_kind", "cycle") == "cycle" and c.metadata.get("has_life", True)]
         review, aggregation = self.include_review.isChecked(), self.aggregate.currentData()
         keys = [(channel, self._cycle_table_key(channel, review)) for channel in channels]
         pending = [(channel, key) for channel, key in keys if key not in self._summary_cache]
         current = self._jobs.get('analysis')
-        def display(tables, errors, active_baseline, active_aggregation):
+        def display(tables, errors, active_baseline, active_aggregation, energy_baseline):
             self._summaries = {}
             for channel, key in keys:
                 if key not in tables:
                     continue
                 try:
                     self._summaries[channel.id] = apply_cycle_baseline(
-                        tables[key][active_aggregation], channel.name, active_baseline, first_cycle=2)
+                        tables[key][active_aggregation], channel.name, active_baseline, first_cycle=2,
+                        independent_energy=True, energy_baseline_cycle=energy_baseline)
                 except ValueError as exc:
                     errors.append(str(exc))
             self._dirty_pages.difference_update([0, 1, 5])
@@ -941,7 +1094,7 @@ class StudioWindow(QMainWindow):
         if not pending:
             if current or 'analysis' in self._queued_jobs:
                 self._invalidate_analysis()
-            display(self._summary_cache, [], baseline, aggregation)
+            display(self._summary_cache, [], baseline, aggregation, energy_baseline)
             return
         requested = tuple(key for _, key in pending)
         if (self._summary_pending == (self._tokens.get('analysis'), requested) and
@@ -964,7 +1117,8 @@ class StudioWindow(QMainWindow):
         def ready(result):
             tables, errors = result
             self._summary_cache.update(tables)
-            display(self._summary_cache, errors, self._baseline_value(), self.aggregate.currentData())
+            display(self._summary_cache, errors, self._baseline_value(), self.aggregate.currentData(),
+                    self._energy_baseline_value())
         self._start('analysis', calculate, ready)
         self._summary_pending = (self._tokens['analysis'], requested)
 
@@ -989,68 +1143,103 @@ class StudioWindow(QMainWindow):
                 self._dcir_baselines.pop(channel.id, None)
             self.render_summaries()
 
+    def _cycle_offset(self):
+        return self.summary_start.value() - 1 if self.relative_cycles.isChecked() else 0
+
     def _display_cycles(self, frame):
         if frame is None or frame.empty:
             return frame
         start = self.summary_start.value()
         visible = frame.loc[frame['Cycle'] >= start].copy()
-        visible['Cycle'] = visible['Cycle'] - start + 1
+        offset = self._cycle_offset()
+        if offset:
+            visible['Source_Cycle'] = visible['Cycle']
+            visible['Cycle'] = visible['Cycle'] - offset
         return visible
 
+    def _summary_series(self, channel, frame, field, *, suffix='', direction=''):
+        if field not in frame:
+            return None
+        x, y = frame['Cycle'].to_numpy(), frame[field].to_numpy(dtype=float)
+        if not np.isfinite(y).any():
+            return None
+        if channel.metadata.get('input_type') == 'study_cell':
+            gaps = np.flatnonzero(np.diff(x) > 1) + 1
+            y = np.insert(y, gaps, np.nan)
+            x = np.insert(x, gaps, x[gaps] - 1)
+        identity = channel.metadata.get('management_id', channel.name)
+        return dict(x=x, y=y, direction=direction, name=identity + suffix, source_id=channel.id,
+                    point_kind='calculated', color=self._channel_color(channel.id))
+
     def render_summaries(self, *_):
-        for index, page in [(0, self.summary), (1, self.life), (5, self.compare)]:
-            if index not in self.metric_widgets:
+        if self._restoring or self.nav.currentRow() not in (SUMMARY, LIFE, COMPARE):
+            return
+        index = self.nav.currentRow()
+        page, graph_key = {SUMMARY: (self.summary, 'summary'), LIFE: (self.life, 'life'),
+                           COMPARE: (self.compare, 'compare')}[index]
+        combo = self.metric_widgets.get(index)
+        if combo is None:
+            return
+        metric = combo.currentData()
+        energy_default = index == SUMMARY and metric == 'Energy_Retention_pct'
+        overlay = index == SUMMARY and metric == 'Discharge_Capacity_Retention_pct' and self.show_dcir.isChecked()
+        x_label = '표시 Cycle' if self.relative_cycles.isChecked() else '누적 Cycle'
+        if metric in ('resistance_1s', 'resistance_10s'):
+            seconds = metric.removeprefix('resistance_')
+            series = [(f'Charge_R_{seconds}_mOhm', ' · 충전', 'charge'),
+                      (f'Discharge_R_{seconds}_mOhm', ' · 방전', 'discharge')]
+        else:
+            series = [(metric, '', '')]
+        curves, energy, frames = [], [], []
+        channels = self.selected_channels()
+        for channel in channels:
+            frame = self._display_cycles(self._summaries.get(channel.id))
+            if frame is None or frame.empty:
                 continue
-            combo = self.metric_widgets[index]
-            metric = combo.currentData()
-            curves, frames = [], []
-            for channel in self.selected_channels():
-                frame = self._display_cycles(self._summaries.get(channel.id))
-                if frame is None or frame.empty:
-                    continue
-                points = dcir_changes(channel.metadata.get('dcir50', []), self._dcir_baselines.get(channel.id))
-                displayed = {cycle - self.summary_start.value() + 1: change for cycle, change in points.items()
-                             if cycle >= self.summary_start.value()}
-                enriched = frame.copy()
-                if displayed:
-                    enriched['RPT_SOC50_10s_DCIR_Change_pct'] = enriched['Cycle'].map(displayed)
-                enriched.insert(0, 'Channel', channel.name)
+            metrics = [field for field, _, _ in series]
+            if energy_default:
+                metrics.insert(0, 'Discharge_Energy_mWh')
+            fields = ['Cycle', *metrics]
+            if self.relative_cycles.isChecked():
+                fields.insert(1, 'Source_Cycle')
+            enriched = frame.copy() if self.full_summary.isChecked() else frame.reindex(columns=fields)
+            if len(channels) > 1 or self.full_summary.isChecked():
+                if 'Channel' not in enriched:
+                    enriched.insert(0, 'Channel', channel.metadata.get('management_id', channel.name))
+            if self.full_summary.isChecked():
                 enriched['Source_ID'] = channel.id
-                preferred = ['Channel', 'Cycle', 'OriginalCycle', 'Discharge_Capacity_mAh',
-                    'Discharge_Capacity_Retention_pct', 'Discharge_Energy_mWh', 'Energy_Retention_pct',
-                    'Coulombic_Efficiency_pct', 'Energy_Efficiency_pct', 'Max_Temp_C', 'Baseline_Cycle']
-                ordered = [name for name in preferred if name in enriched]
-                enriched = enriched[ordered + [col for col in enriched if col not in ordered]]
-                frames.append(enriched)
-                if metric in ('resistance_1s', 'resistance_10s'):
-                    seconds = metric.removeprefix('resistance_')
-                    series = [(f'Charge_R_{seconds}_mOhm', ' · 충전', 'charge'),
-                              (f'Discharge_R_{seconds}_mOhm', ' · 방전', 'discharge')]
-                else:
-                    series = [(metric, '', '')]
-                for field, suffix, direction in series:
-                    if field not in frame:
-                        continue
-                    x = frame['Cycle'].to_numpy()
-                    y = frame[field].to_numpy(dtype=float)
-                    if channel.metadata.get('input_type') == 'study_cell':
-                        gaps = np.flatnonzero(np.diff(x) > 1) + 1
-                        y = np.insert(y, gaps, np.nan)
-                        x = np.insert(x, gaps, x[gaps] - 1)
-                    curves.append(dict(x=x, y=y, direction=direction,
-                        name=channel.name + suffix, source_id=channel.id, point_kind='calculated',
-                        color=self._channel_color(channel.id)))
-                if index == 0 and metric == 'Discharge_Capacity_Retention_pct' and displayed:
+            if overlay:
+                points = dcir_changes(channel.metadata.get('dcir50', []), self._dcir_baselines.get(channel.id),
+                                      bol_baseline=channel.metadata.get('dcir_baseline_mohm'))
+                displayed = {cycle - self._cycle_offset(): change for cycle, change in points.items()
+                             if cycle >= self.summary_start.value()}
+                enriched['RPT_SOC50_10s_DCIR_Change_pct'] = enriched['Cycle'].map(displayed)
+                if displayed:
                     xs = sorted(displayed)
                     curves.append(dict(x=xs, y=[displayed[x] for x in xs], right_axis=True,
-                        name=f'{channel.name} · SOC 50% 방전 10초 DCIR', source_id=channel.id,
-                        point_kind='calculated', color=self._channel_color(channel.id)))
-            page.graph.set_labels('Cycle', combo.currentText())
-            page.graph.set_curves(curves, right_label='SOC 50% 방전 10초 DCIR 변화율 (%)')
-            if index in self._dirty_pages:
-                page.graph.set_stale(True)
-            page.table.set_frame(pd.concat(frames, ignore_index=True) if frames else pd.DataFrame())
-            self._restore_graph({0: 'summary', 1: 'life', 5: 'compare'}[index], page.graph)
+                        name=f"{channel.metadata.get('management_id', channel.name)} · SOC 50% 방전 10초 DCIR",
+                        source_id=channel.id, point_kind='calculated', color=self._channel_color(channel.id)))
+            frames.append(enriched)
+            for field, suffix, direction in series:
+                curve = self._summary_series(channel, frame, field, suffix=suffix, direction=direction)
+                if curve:
+                    curves.append(curve)
+            if energy_default:
+                secondary = self._summary_series(channel, frame, 'Discharge_Energy_mWh')
+                if secondary:
+                    energy.append(secondary)
+        page.graph.set_labels(x_label, combo.currentText())
+        page.graph.set_curves(curves, right_label='SOC 50% 방전 10초 DCIR 변화율 (%)')
+        if index in self._dirty_pages:
+            page.graph.set_stale(True)
+        page.table.set_frame(pd.concat(frames, ignore_index=True) if frames else pd.DataFrame())
+        if index == SUMMARY:
+            self.energy_graph.setVisible(energy_default and bool(energy))
+            if energy:
+                self.energy_graph.set_labels(x_label, '방전에너지 (mWh)')
+                self.energy_graph.set_curves(energy)
+                self.energy_graph.set_stale(index in self._dirty_pages)
+        self._restore_graph(graph_key, page.graph)
         self.update_cards()
 
     def update_cards(self):
@@ -1059,13 +1248,26 @@ class StudioWindow(QMainWindow):
         channel = self.active_channel()
         summary = self._display_cycles(self._summaries.get(channel.id)) if channel else None
         values = ['—'] * 4
+        caption = '분석할 셀을 선택하세요.'
+        if channel:
+            caption = channel.metadata.get('management_id', channel.name)
+            if channel.metadata.get('has_life') is False:
+                caption += ' · 수명 데이터 미등록 · RPT 비교에서 측정 결과를 볼 수 있습니다.'
+            reference = channel.metadata.get('reference_bol_label')
+            if reference:
+                caption += f'  ·  DCIR 기준 BOL: {reference}'
+            elif self._dcir_baselines.get(channel.id):
+                caption += f'  ·  DCIR 수동 기준: {self._dcir_baselines[channel.id]:g} mΩ'
         if summary is not None and not summary.empty:
             row = summary.iloc[-1]
-            values = [display_value(row.get('Discharge_Capacity_mAh')) + ' mAh',
-                      display_value(row.get('Discharge_Capacity_Retention_pct')) + ' %',
-                      display_value(row.get('Max_Temp_C')) + ' °C',
-                      display_value(row.get('Baseline_Cycle', summary.attrs.get('baseline_cycle')))]
-        for card, title, value in zip(self.cards, ['방전용량', '용량 유지율', '최대 온도', '기준 Cycle'], values):
+            basis = summary.attrs.get('energy_baseline_cycle')
+            values = [display_value(row.get('Source_Cycle', row.get('Cycle'))),
+                      display_value(row.get('Discharge_Energy_mWh')) + ' mWh',
+                      display_value(row.get('Energy_Retention_pct')) + ' %', display_value(basis)]
+            if basis is None:
+                caption += ' · 표시할 방전에너지 유지율 기준값이 없습니다.'
+        self.summary_header.setText(caption)
+        for card, title, value in zip(self.cards, ['진행 Cycle', '방전에너지', '방전에너지 유지율', '에너지 기준 Cycle'], values):
             card.setText(f'{title}\n{value}')
 
     def _channel_color(self, channel_id):
@@ -1073,13 +1275,13 @@ class StudioWindow(QMainWindow):
         return PALETTE[(ids.index(channel_id) if channel_id in ids else 0) % len(PALETTE)]
 
     def _color_curves(self, curves, *, prefer_cycles=False):
-        cycles = [int(c.get('cycle', 0)) for c in curves] or [0]
+        cycles = [int(c.get('color_cycle', c.get('cycle', 0))) for c in curves] or [0]
         channel_mode = self.color_mode.currentData() == 'channel' or (
             not prefer_cycles and self.color_mode.currentData() == 'auto'
             and len({c.get('source_id') for c in curves}) > 1)
         colors = cycle_gradient(cycles)
         for curve in curves:
-            curve['color'] = self._channel_color(curve.get('source_id')) if channel_mode else colors[int(curve.get('cycle', 0))]
+            curve['color'] = self._channel_color(curve.get('source_id')) if channel_mode else colors[int(curve.get('color_cycle', curve.get('cycle', 0)))]
 
     def _recolor_graphs(self):
         for graph in (self.raw.graph, self.dq_plot, self.vq_plot, self.dvdq_plot):
@@ -1094,24 +1296,63 @@ class StudioWindow(QMainWindow):
             raise ValueError('한 번에 2,000개 이하의 Cycle을 선택하세요.')
         return cycles
 
+    def _open_raw_view(self):
+        self.advanced_navigation.setChecked(True)
+        self.nav.setCurrentRow(RAW)
+
+    def _curve_source_changed(self, *_):
+        is_rpt = self.curve_source.currentData() == 'rpt'
+        if hasattr(self, 'dq_cycles'):
+            self.dq_cycles.setEnabled(not is_rpt)
+        if hasattr(self, '_selection_timer') and not self._restoring:
+            self.mark_dirty()
+            self.refresh_current()
+
+    def _compare_rpt_curves(self, channels):
+        self._rpt_curve_ids = tuple(c.id for c in channels)
+        self._restoring = True
+        try:
+            self.curve_source.setCurrentIndex(self.curve_source.findData('rpt'))
+            self.dq_tabs.setCurrentIndex(0)
+            self.nav.setCurrentRow(CURVES)
+        finally:
+            self._restoring = False
+        self.calculate_derivatives()
+
+    def _curve_targets(self, edit):
+        cell = self.active_channel()
+        if self.curve_source.currentData() == 'rpt':
+            allowed = rpt_checkpoints(cell, self.channels)
+            if not self.study_workspace.study and not allowed:
+                allowed = [c for c in self.channels if c.metadata.get('import_kind') == 'rpt']
+            by_id = {channel.id: channel for channel in allowed}
+            chosen = [by_id[id_] for id_ in self._rpt_curve_ids if id_ in by_id]
+            if not chosen:
+                raise ValueError('RPT 비교에서 시점을 체크한 뒤 dQ/dV 비교를 누르세요.')
+            return [(c, c.cycles[:1]) for c in chosen if c.cycles]
+        all_channels = self.selected_channels()
+        if self.study_workspace.study:
+            all_channels = [c for c in all_channels if c.metadata.get('has_life', True)]
+        cycles = self._cycles(edit)
+        return [(channel, cycles) for channel in all_channels]
+
     def calculate_raw(self):
         try:
-            cycles = self._cycles(self.raw_cycles)
+            targets = self._curve_targets(self.raw_cycles)
         except ValueError as exc:
             self.show_error(str(exc))
             return
-        channels = self.selected_channels()
         kwargs = dict(x=self.raw_x.currentData(), y=self.raw_y.currentData(),
                       direction=self.raw_direction.currentData(), step=self.raw_step.text().strip(),
                       include_review=self.include_review.isChecked())
         x_label, y_label = self.raw_x.currentText(), self.raw_y.currentText()
-        key = (tuple((c.id, c.fingerprint) for c in channels), tuple(cycles), tuple(kwargs.items()))
+        key = (tuple((c.id, c.fingerprint, tuple(cycles)) for c, cycles in targets), tuple(kwargs.items()))
         def calculate(progress, cancel):
             curves, errors = [], []
-            for i, channel in enumerate(channels):
+            for i, (channel, cycles) in enumerate(targets):
                 if cancel():
                     raise InterruptedError('Raw 분석 취소')
-                progress(i, len(channels), f'Raw 준비 · {channel.name}')
+                progress(i, len(targets), f'Raw 준비 · {channel.name}')
                 try:
                     curves.extend(raw_curves(channel, cycles, display_budget=PREVIEW_POINTS, cancel=cancel, **kwargs))
                 except InterruptedError:
@@ -1150,20 +1391,20 @@ class StudioWindow(QMainWindow):
 
     def calculate_derivatives(self):
         try:
-            cycles = self._cycles(self.dq_cycles)
+            targets = [(channel, cycles) for channel, cycles in self._curve_targets(self.dq_cycles)
+                       if channel.metadata.get('import_kind') != 'other']
         except ValueError as exc:
             self.show_error(str(exc))
             return
-        channels = [c for c in self.selected_channels() if c.metadata.get("import_kind") != "other"]
         settings = self.derivative_settings()
         settings.pop('peak_track_shift_mv')
-        key = (tuple((c.id, c.fingerprint) for c in channels), tuple(cycles), tuple(settings.items()))
+        key = (tuple((c.id, c.fingerprint, tuple(cycles)) for c, cycles in targets), tuple(settings.items()))
         def calculate(progress, cancel):
             result = []
-            for i, channel in enumerate(channels):
+            for i, (channel, cycles) in enumerate(targets):
                 if cancel():
                     raise InterruptedError('미분 분석 취소')
-                progress(i, len(channels), f'미분 분석 · {channel.name}')
+                progress(i, len(targets), f'미분 분석 · {channel.name}')
                 try:
                     result.extend(cached_derivatives(channel, cycles, settings, cancel))
                 except InterruptedError:
@@ -1182,41 +1423,60 @@ class StudioWindow(QMainWindow):
             self._start('analysis', calculate, ready)
 
     def render_derivatives(self, result):
-        self._dirty_pages.discard(3)
-        self._derivatives = result
-        valid = [c for c in result if not c.get('error') and len(c.get('x', []))]
-        errors = [c['error'] for c in result if c.get('error')]
-        self._color_curves(valid, prefer_cycles=True)
+        self._dirty_pages.discard(CURVES)
+        labels = {c.id: c for c in self.channels}
+        active = self.active_channel()
+        self._derivatives = []
+        for original in result:
+            row = dict(original)
+            channel = labels.get(row.get('source_id'))
+            if channel and channel.metadata.get('import_kind') == 'rpt' and not row.get('error'):
+                label = checkpoint_label(channel, active)
+                row['legend_label'] = label
+                row['color_cycle'] = (channel.metadata.get('rpt_link') or {}).get('cycle') or 0
+                row['name'] = f"{label} · {row.get('direction', '')}"
+            self._derivatives.append(row)
+        valid = [c for c in self._derivatives if not c.get('error') and len(c.get('x', []))]
         for c in valid:
             c['point_kind'] = 'calculated'
-        self.dq_plot.set_curves(valid, group_cycles=True, show_peaks=True)
-        self.vq_plot.set_curves([dict(c, x=c['vq_x'], y=c['vq_y']) for c in valid], group_cycles=True)
-        self.dvdq_plot.set_curves([dict(c, x=c['dvdq_x'], y=c['dvdq_y']) for c in valid], group_cycles=True)
-        peaks = []
-        for c in valid:
-            for p in c.get('peaks', []):
-                peaks.append(dict(Source_ID=c.get('source_id'), Channel=c.get('name'), Cycle=c.get('cycle'),
-                    Step=c.get('step'), Direction=c.get('direction'), **p))
-        self.peak_table.set_frame(pd.DataFrame(peaks))
-        shift_mv = self.dq_track_shift.value()
-        tracked = track_peaks(valid, max_shift_v=shift_mv / 1000.)
-        trends = {}
-        if not tracked.empty:
-            for key, group in tracked.groupby(['Source_ID', 'Direction', 'Peak_ID']):
-                trends[key] = group
-        trend_curves = []
-        for (source, direction, identity), pts in trends.items():
-            pts = pts.sort_values('Cycle')
-            voltage_key = 'Voltage_V' if 'Voltage_V' in pts else 'voltage'
-            trend_curves.append(dict(x=pts['Cycle'].to_numpy(), y=pts[voltage_key].to_numpy(),
-                name=f'{source[:6]} · {direction} · 피크 {identity}', source_id=source,
-                point_kind='calculated'))
-        self.peak_trend.set_curves(trend_curves)
-        self._restore_graph('dq', self.dq_plot)
-        self.dq_note.setText(f'{len(valid)}개 곡선 · 원형 마커는 검출 피크 · 피크 추이는 최대 {shift_mv:g} mV 이동 내에서 대응 (수동 검토 필요)'
-                             + (' · ' + ' / '.join(errors[:4]) if errors else ''))
+        self._color_curves(valid, prefer_cycles=True)
+        self._derivative_tabs_ready.clear()
+        self._render_derivative_tab(self.dq_tabs.currentIndex())
+        errors = [row['error'] for row in self._derivatives if row.get('error')]
+        self.dq_note.setText(f'{len(valid)}개 곡선 · 원형 마커는 검출 피크'
+                             + (f' · 계산할 수 없는 구간 {len(errors)}개' if errors else ''))
+        self.dq_note.setToolTip('\n'.join(dict.fromkeys(errors)))
         if errors:
-            self.show_error(' / '.join(errors[:4]))
+            self.statusBar().showMessage(f'미분 계산 확인 필요 · {len(errors)}개 구간')
+
+    def _render_derivative_tab(self, index):
+        if index in self._derivative_tabs_ready or CURVES in self._dirty_pages:
+            return
+        valid = [c for c in self._derivatives if not c.get('error') and len(c.get('x', []))]
+        if index == 0:
+            self.dq_plot.set_curves(valid, group_cycles=True, show_peaks=True)
+            self._restore_graph('dq', self.dq_plot)
+        elif index in (1, 2):
+            graph, x, y = (self.vq_plot, 'vq_x', 'vq_y') if index == 1 else (self.dvdq_plot, 'dvdq_x', 'dvdq_y')
+            graph.set_curves([dict(c, x=c[x], y=c[y]) for c in valid], group_cycles=True)
+        elif index == 3:
+            self.peak_table.set_frame(pd.DataFrame([
+                dict(Source_ID=c.get('source_id'), Channel=c.get('name'), Cycle=c.get('cycle'),
+                     Step=c.get('step'), Direction=c.get('direction'), **peak)
+                for c in valid for peak in c.get('peaks', [])]))
+        elif index == 4:
+            shift_mv = self.dq_track_shift.value()
+            tracked = track_peaks(valid, max_shift_v=shift_mv / 1000.)
+            curves = []
+            if not tracked.empty:
+                for (source, direction, identity), group in tracked.groupby(['Source_ID', 'Direction', 'Peak_ID']):
+                    pts = group.sort_values('Cycle')
+                    voltage_key = 'Voltage_V' if 'Voltage_V' in pts else 'voltage'
+                    curves.append(dict(x=pts['Cycle'].to_numpy(), y=pts[voltage_key].to_numpy(),
+                        name=f'{source[:6]} · {direction} · 피크 {identity}', source_id=source,
+                        point_kind='calculated'))
+            self.peak_trend.set_curves(curves)
+        self._derivative_tabs_ready.add(index)
 
     def _restore_graph(self, name, graph):
         state = getattr(self, '_saved_graphs', {}).pop(name, None)
@@ -1244,6 +1504,9 @@ class StudioWindow(QMainWindow):
             active_channel=self.active_channel().id if self.active_channel() else None,
             page=self.nav.currentRow(), baseline=self.baseline.text(), aggregation=self.aggregate.currentData(),
             summary_start=self.summary_start.value(), dcir_baselines=dict(self._dcir_baselines),
+            comparison_channels=sorted(self._tree_checked_ids()), relative_cycles=self.relative_cycles.isChecked(),
+            energy_baseline=self.energy_baseline.text(), show_dcir=self.show_dcir.isChecked(),
+            full_summary=self.full_summary.isChecked(),
             include_review=self.include_review.isChecked(),
             color_mode=self.color_mode.currentData(),
             metrics={str(k): v.currentData() for k, v in self.metric_widgets.items()},
@@ -1259,7 +1522,12 @@ class StudioWindow(QMainWindow):
         try:
             self.baseline.setText(str(state.get('baseline', '')))
             self._dcir_baselines = dict(state.get('dcir_baselines', {}))
-            self.summary_start.setValue(int(state.get('summary_start', 2)))
+            self.summary_start.setValue(int(state.get('summary_start', 1)) if 'relative_cycles' in state
+                                        or state.get('summary_start', 2) != 2 else 1)
+            self.relative_cycles.setChecked(bool(state.get('relative_cycles', False)))
+            self.energy_baseline.setText(str(state.get('energy_baseline', '')))
+            self.show_dcir.setChecked(bool(state.get('show_dcir', False)))
+            self.full_summary.setChecked(bool(state.get('full_summary', False)))
             self.aggregate.setCurrentIndex(max(0, self.aggregate.findData(state.get('aggregation', 'representative'))))
             self.include_review.setChecked(bool(state.get('include_review', False)))
             self.color_mode.setCurrentIndex(max(0, self.color_mode.findData(state.get('color_mode', 'auto'))))
@@ -1267,7 +1535,8 @@ class StudioWindow(QMainWindow):
                 combo = self.metric_widgets.get(int(key))
                 if combo:
                     combo.setCurrentIndex(max(0, combo.findData(value)))
-            selected = state.get('selected_channels')
+            selected = (state.get('comparison_channels', []) if self.study_workspace.study
+                        else state.get('selected_channels'))
             for i in range(self.tree.topLevelItemCount()):
                 for j in range(self.tree.topLevelItem(i).childCount()):
                     child = self.tree.topLevelItem(i).child(j)
@@ -1296,7 +1565,10 @@ class StudioWindow(QMainWindow):
             self.dcr.restore_state(state.get('dcr', {}), auto_detect=False)
             if state.get('main_split'):
                 self.main_splitter.setSizes(state['main_split'])
-            self.nav.setCurrentRow(max(0, min(6, int(state.get('page', 0)))))
+            page = max(0, min(HOME, int(state.get('page', SUMMARY))))
+            if self.nav.item(page).isHidden():
+                self.advanced_navigation.setChecked(True)
+            self.nav.setCurrentRow(page)
             self._saved_graphs = state.get('graphs', {})
         finally:
             self._restoring = False
@@ -1403,8 +1675,16 @@ class StudioWindow(QMainWindow):
             if row == 2 and self.raw_tables.currentIndex() == 2:
                 return self.source_table.model.frame
             return self.pages[row].table.model.frame
-        if row == 3:
-            return self.peak_table.model.frame
+        if row == CURVES:
+            tab = self.dq_tabs.currentIndex()
+            if tab == 3:
+                return self.peak_table.model.frame
+            graph = {0: self.dq_plot, 1: self.vq_plot, 2: self.dvdq_plot, 4: self.peak_trend}[tab]
+            frames = [pd.DataFrame(dict(Curve=c['name'], X=c['x'], Y=c['y'],
+                                        X_Axis=graph.plot.getAxis('bottom').labelText,
+                                        Y_Axis=graph.plot.getAxis('left').labelText))
+                      for c in graph.checked_curves()]
+            return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
         if row == 4:
             return pd.DataFrame(getattr(self.dcr, 'result_rows', [])) if self.dcr.result_valid else pd.DataFrame()
         frames = []
@@ -1428,6 +1708,10 @@ class StudioWindow(QMainWindow):
             self.statusBar().showMessage(f'저장 완료 · {path}')
 
     def show_rpt_results(self):
+        if self.study_workspace.study:
+            self.nav.setCurrentRow(RPT)
+            self.refresh_current()
+            return
         channels = [c for c in self.channels if c.metadata.get("import_kind") == "rpt"]
         if not channels:
             self.show_error('RPT로 분류한 파일을 먼저 가져오세요.')
@@ -1484,23 +1768,29 @@ class StudioWindow(QMainWindow):
                         lambda _: self.statusBar().showMessage(f'Raw CSV 저장 완료 · {path}'))
 
     def export_summary_origin(self):
+        self._export_visible_origin(self.summary.graph, '수명 Summary')
+
+    def _export_visible_origin(self, graph, title):
         from .origin_export import prepare_summary_curves, paste_origin_to_powerpoint
 
-        graph = self.summary.graph
         curves = prepare_summary_curves(graph.checked_curves())
         if graph._stale or not curves:
-            self.show_error('Summary를 계산하고 범례에서 붙여넣을 곡선을 체크하세요.')
+            self.show_error('그래프를 계산하고 범례에서 붙여넣을 곡선을 체크하세요.')
             return
         if 'origin_export' in self._jobs or 'origin_export' in self._queued_jobs:
             return
         y_label = graph.plot.getAxis('left').labelText
+        x_label = graph.plot.getAxis('bottom').labelText
         ranges = tuple(tuple(axis) for axis in graph.plot.viewRange())
         right_label = graph.right_label if any(c.right_axis for c in curves) else ''
         self._start('origin_export', lambda progress, cancel: paste_origin_to_powerpoint(
-            curves, 'Summary', 'Cycle', y_label, progress, cancel, ranges, right_label=right_label),
+            curves, title, x_label, y_label, progress, cancel, ranges, right_label=right_label),
             lambda slide: self.statusBar().showMessage(f'PPT 붙여넣기 완료 · {slide}'))
 
     def export_origin(self, graph, title):
+        if any(c.get('legend_label') for c in graph.checked_curves()):
+            self._export_visible_origin(graph, 'RPT ' + title)
+            return
         from .origin_export import paste_origin_to_powerpoint, prepare_curves
 
         if graph._stale:
@@ -1566,6 +1856,7 @@ class StudioWindow(QMainWindow):
             return
         try:
             baseline = self._baseline_value()
+            energy_baseline = self._energy_baseline_value()
         except ValueError as exc:
             self.show_error(str(exc))
             return
@@ -1579,6 +1870,10 @@ class StudioWindow(QMainWindow):
         cache_dir = self._cycle_cache_dir()
         peaks = self.peak_table.model.frame.copy() if 3 not in self._dirty_pages else pd.DataFrame()
         dcr_rows = list(getattr(self.dcr, 'result_rows', [])) if self.dcr.result_valid else []
+        if self.study_workspace.study:
+            active = self.active_channel()
+            seen = {c.id for c in channels}
+            channels.extend(c for c in rpt_checkpoints(active, self.channels) if c.id not in seen)
         def export(progress, cancel):
             temp = Path(path).with_suffix('.partial.xlsx')
             try:
@@ -1588,16 +1883,24 @@ class StudioWindow(QMainWindow):
                         if cancel():
                             raise InterruptedError('Excel 저장 취소')
                         progress(i, len(channels), f'Excel 저장 · {c.name}')
-                        key = self._cycle_table_key(c, review)
-                        base = cached_tables.get(key)
-                        if base is None:
-                            base = prepare_cycle_tables(c, key[-1], cache_dir, cancel)
-                        summary = apply_cycle_baseline(base[aggregation], c.name, baseline, first_cycle=2)
-                        for start in range(0, max(1, len(summary)), 1000000):
-                            summary.iloc[start:start + 1000000].to_excel(writer, sheet_name=f'Life_{i + 1}_{start // 1000000 + 1}', index=False)
-                        if len(c.steps):
-                            for start in range(0, len(c.steps), 1000000):
-                                c.steps.iloc[start:start + 1000000].to_excel(writer, sheet_name=f'Steps_{i + 1}_{start // 1000000 + 1}', index=False)
+                        kind = c.metadata.get('import_kind', 'cycle')
+                        if kind == 'cycle' and c.metadata.get('has_life', True):
+                            key = self._cycle_table_key(c, review)
+                            base = cached_tables.get(key)
+                            if base is None:
+                                base = prepare_cycle_tables(c, key[-1], cache_dir, cancel)
+                            summary = apply_cycle_baseline(base[aggregation], c.name, baseline, first_cycle=2,
+                                independent_energy=True, energy_baseline_cycle=energy_baseline)
+                            for start in range(0, max(1, len(summary)), 1000000):
+                                summary.iloc[start:start + 1000000].to_excel(writer, sheet_name=f'Life_{i + 1}_{start // 1000000 + 1}', index=False)
+                        elif kind == 'rpt':
+                            rpt = pd.DataFrame(c.frame.rpt_rows())
+                            if not rpt.empty:
+                                rpt.to_excel(writer, sheet_name=f'RPT_{i + 1}', index=False)
+                        steps = read_step_table(c)
+                        if len(steps):
+                            for start in range(0, len(steps), 1000000):
+                                steps.iloc[start:start + 1000000].to_excel(writer, sheet_name=f'Steps_{i + 1}_{start // 1000000 + 1}', index=False)
                         provenance.append(dict(ID=c.id, Channel=c.name, Source=c.source_path,
                             Warnings=' / '.join(c.warnings), Metadata=json.dumps(c.metadata, ensure_ascii=False, default=str)))
                     pd.DataFrame(provenance).to_excel(writer, sheet_name='Sources', index=False)

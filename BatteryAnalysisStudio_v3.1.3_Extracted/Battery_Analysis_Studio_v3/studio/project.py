@@ -125,7 +125,6 @@ def _save_compact_sources(destination, channels, sources):
 def project_channels(project):
     """Return prepared channels directly, or None for a source-based project."""
     from .compact_data import CompactStore
-    from .ingestion import _cache_read
     from .models import ChannelData
     parent = Path(project["project_path"]).parent
     entries = project["sources"]
@@ -136,9 +135,11 @@ def project_channels(project):
         path = (parent / entry["curve_store"]).resolve()
         if not path.is_relative_to(parent):
             raise ValueError("프로젝트 데이터 저장 경로가 잘못되었습니다.")
-        cached = _cache_read(path, "channel")
-        if cached is None:
-            raise ValueError(f"{entry['name']}: 프로젝트 축소 데이터 폴더를 찾을 수 없습니다. .basproj 파일과 .data 폴더를 함께 보관하세요.")
-        result.append(ChannelData(entry["id"], entry["name"], entry["source_path"],
-                                  CompactStore(path), cached[1], entry["metadata"], entry.get("warnings", [])))
+        try:
+            store = CompactStore(path)
+            metadata, warnings = store.channel_metadata()
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise ValueError(f"{entry['name']}: 프로젝트 축소 데이터 폴더를 찾을 수 없습니다. .basproj 파일과 .data 폴더를 함께 보관하세요.") from exc
+        result.append(ChannelData(entry["id"], entry["name"], entry["source_path"], store,
+                                  metadata=entry.get("metadata", metadata), warnings=entry.get("warnings", warnings)))
     return result

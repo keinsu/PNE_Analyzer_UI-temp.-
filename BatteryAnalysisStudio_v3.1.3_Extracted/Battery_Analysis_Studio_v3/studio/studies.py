@@ -4,6 +4,7 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime
 import hashlib
+import math
 import json
 import os
 from pathlib import Path
@@ -113,6 +114,36 @@ def _segments_for(cell, entry_id=None):
     return (entry for entry in cell["segments"] if entry["id"] != entry_id)
 
 
+def _find_cell(cells, cell_id):
+    return next((cell for cell in cells if cell["id"] == cell_id), None)
+
+
+def _make_cell(cells, cell_name, management_id):
+    cell_name, management_id = cell_name.strip(), management_id.strip()
+    if not cell_name or any(cell["name"].casefold() == cell_name.casefold() for cell in cells):
+        raise ValueError("새 셀 이름을 입력하고 시험 내에서 중복되지 않도록 지정하세요.")
+    if not management_id or any(cell.get("management_id", cell["name"]).casefold() == management_id.casefold()
+                                for cell in cells):
+        raise ValueError("관리 ID를 입력하고 시험 내에서 중복되지 않도록 지정하세요.")
+    cell = dict(id=uuid.uuid4().hex, name=cell_name, management_id=management_id, segments=[])
+    cells.append(cell)
+    return cell
+
+
+def _cell_label(cell):
+    identifier = cell.get("management_id", cell["name"])
+    return identifier if identifier == cell["name"] else f"{identifier} · {cell['name']}"
+
+
+def _linked_rpt(records):
+    result = {}
+    for record in records:
+        cell_id = record.get("rpt_link", {}).get("cell_id")
+        if cell_id:
+            result.setdefault(cell_id, []).append(record)
+    return result
+
+
 class Study:
     def __init__(self, directory):
         self.directory = Path(directory).resolve()
@@ -192,10 +223,75 @@ class Study:
             candidate["history"].append(dict(at=_now(), text="\n".join(messages)))
         return candidate, messages, changed
 
-    def _store(self, channel, cancel):
+    def _store(self, channel, cancel, tables):
         from .compact_data import prepare_channel
-        stored = prepare_channel(channel, self.cache_dir, cancel)
+        aggregates = {review: {mode: pd.DataFrame(rows) for mode, rows in tables.get(str(int(review)), {}).items()}
+                      for review in (False, True)}
+        stored = prepare_channel(channel, self.cache_dir, cancel, cycle_tables=aggregates)
         return stored.frame.path.relative_to(self.directory).as_posix()
+
+    def bol_records(self, cell_id):
+        return [record for record in self.data["rpt"]
+                if record.get("rpt_link", {}).get("cell_id") == cell_id
+                and record["rpt_link"].get("stage") == "bol"]
+
+    def set_bol_reference(self, cell_id, reference_id):
+        candidate = deepcopy(self.data)
+        cell = _find_cell(candidate["cells"], cell_id)
+        reference = _find_cell(candidate["cells"], reference_id)
+        if cell is None:
+            raise ValueError("기준 BOL을 설정할 셀을 찾을 수 없습니다.")
+        if reference_id == cell_id:
+            reference_id = None
+        if reference_id is not None and (reference is None or not self.bol_records(reference_id)):
+            raise ValueError("BOL RPT가 등록된 셀을 선택하세요.")
+        if reference_id == cell.get("bol_reference_id"):
+            return
+        if reference_id is None:
+            cell.pop("bol_reference_id", None)
+        else:
+            cell["bol_reference_id"] = reference_id
+        source = _cell_label(reference) if reference_id is not None else "자체 BOL"
+        candidate["history"].append(dict(at=_now(), text=f"{_cell_label(cell)} · 기준 BOL: {source}"))
+        self.commit(candidate)
+
+    def timeline(self, cell_id):
+        """Return the cell's life and RPT events in measured order."""
+        cell = _find_cell(self.data["cells"], cell_id)
+        if cell is None:
+            return []
+        events = [dict(kind="life", record_id=s["id"], cycle=s["start"], end=s["end"],
+                       label=f"{s['start']}–{s['end']} Cycle 수명", channel=s["channel"],
+                       source=s["source"], at=s.get("at", ""))
+                  for s in cell["segments"]]
+        for record in self.data["rpt"]:
+            link = record.get("rpt_link", {})
+            if link.get("cell_id") != cell_id:
+                continue
+            cycle = link.get("cycle")
+            bol = link.get("stage") == "bol"
+            events.append(dict(kind="bol" if bol else "rpt", record_id=record.get("id", record["sha256"]),
+                               cycle=0 if bol else cycle, label="BOL RPT" if bol else f"{cycle} Cycle RPT",
+                               channel=record["name"], source=record["path"], at=record.get("at", "")))
+        return sorted(events, key=lambda event: (event["cycle"] if event["cycle"] is not None else math.inf,
+                                                event["kind"] == "rpt", event["at"]))
+
+    def _rpt_link(self, cells, channel):
+        link = channel.metadata.get("rpt_link", {})
+        if not link:
+            return {}
+        stage, cycle = link.get("stage", "checkpoint"), link.get("cycle")
+        if stage not in {"bol", "checkpoint"} or (stage == "bol" and cycle != 0) or (
+                stage == "checkpoint" and (not isinstance(cycle, int) or isinstance(cycle, bool) or cycle < 1)):
+            raise ValueError(f"{channel.name}: BOL 또는 측정 Cycle을 지정하세요.")
+        cell_id = link.get("cell_id")
+        if cell_id:
+            if _find_cell(cells, cell_id) is None:
+                raise ValueError(f"{channel.name}: 연결할 셀을 찾을 수 없습니다.")
+        else:
+            cell = _make_cell(cells, link.get("cell_name", channel.name), link.get("management_id", ""))
+            cell_id = cell["id"]
+        return dict(cell_id=cell_id, stage=stage, cycle=cycle)
 
     def preview_cycles(self, selections, cancel, auxiliary=()):
         """Build an all-or-nothing revision. Selections include explicit cell/segment IDs."""
@@ -204,17 +300,11 @@ class Study:
         for channel, cell_id, cell_name, start, segment_id, *labels in selections:
             if cancel():
                 raise InterruptedError("구간 비교 취소")
-            cell = next((c for c in candidate["cells"] if c["id"] == cell_id), None)
+            cell = _find_cell(candidate["cells"], cell_id)
             if cell is None:
-                cell_name = cell_name.strip()
-                if not cell_name or any(c["name"].casefold() == cell_name.casefold() for c in candidate["cells"]):
-                    raise ValueError("새 셀 이름이 비어 있거나 이미 사용 중입니다. 기존 셀을 선택하세요.")
-                management_id = labels[0].strip() if labels else cell_name
-                if not management_id or any(c.get("management_id", c["name"]).casefold() == management_id.casefold()
-                                            for c in candidate["cells"]):
-                    raise ValueError("관리 ID를 입력하고 시험 내에서 중복되지 않도록 지정하세요.")
-                cell = dict(id=uuid.uuid4().hex, name=cell_name, management_id=management_id, segments=[])
-                candidate["cells"].append(cell)
+                if cell_id:
+                    raise ValueError("연결할 셀을 찾을 수 없습니다. 시험을 다시 열어 주세요.")
+                cell = _make_cell(candidate["cells"], cell_name, labels[0] if labels else cell_name)
             old = next((s for s in cell["segments"] if s["id"] == segment_id), None)
             if segment_id and old is None:
                 raise ValueError("선택한 갱신 구간이 없습니다.")
@@ -286,7 +376,7 @@ class Study:
                     tables["1"] = deepcopy(tables.get("0", {}))
             if not tables.get("0", {}).get("representative"):
                 raise ValueError(f"{channel.name}: 정량분석에 사용할 확인된 Cycle이 없습니다.")
-            path = self._store(channel, cancel)
+            path = self._store(channel, cancel, tables)
             end = max(incoming)
             stored = RawStore(self.directory / path)
             last_row = stored.read([slice(stored.size - 1, stored.size)], ["_row"])
@@ -324,11 +414,9 @@ class Study:
         for channel in auxiliary:
             if cancel():
                 raise InterruptedError("파일 등록 취소")
-            link = channel.metadata.get("rpt_link", {})
             kind = channel.metadata["import_kind"]
             source_id = channel.id
-            if link and not any(c["id"] == link["cell_id"] for c in candidate["cells"]):
-                raise ValueError(f"{channel.name}: 연결할 수명시험 셀이 없습니다.")
+            link = self._rpt_link(candidate["cells"], channel) if kind == "rpt" else {}
             old = next((record for record in candidate["rpt"] if record.get("id") == source_id), None)
             if old and old.get("fingerprint") == channel.fingerprint and old.get("rpt_link", {}) == link and (
                     kind != "rpt" or old["store"].endswith("-rpt-energy-v1-compact-v2")):
@@ -347,27 +435,48 @@ class Study:
                 candidate["rpt"][candidate["rpt"].index(old)] = record
             else:
                 candidate["rpt"].append(record)
-            messages.append(f"{channel.name}: {'RPT' if kind == 'rpt' else '기타'} 기록 저장")
+            cell = _find_cell(candidate["cells"], link.get("cell_id"))
+            if cell:
+                when = "BOL" if link.get("stage") == "bol" else f"{link['cycle']} Cycle"
+                messages.append(f"{_cell_label(cell)} · {when} RPT 등록")
+            else:
+                messages.append(f"{channel.name}: {'RPT' if kind == 'rpt' else '기타'} 기록 저장")
         return self._preview(candidate, messages)
 
     def channels(self):
+        from .compact_data import CompactStore
+
         channels = []
+        linked = _linked_rpt(self.data["rpt"])
+        cells_by_id = {cell["id"]: cell for cell in self.data["cells"]}
         for cell in self.data["cells"]:
-            store = StudyCellStore(self.directory, cell["segments"])
-            if not cell["segments"]:
+            records = linked.get(cell["id"], [])
+            if not cell["segments"] and not records:
                 continue
+            store = StudyCellStore(self.directory, cell["segments"])
             fingerprint = hashlib.sha256(json.dumps(
                 [(s["id"], s["digest"], s["offset"], s["store"]) for s in cell["segments"]]).encode()).hexdigest()
-            points = [point for record in self.data["rpt"]
-                      if record.get("rpt_link", {}).get("cell_id") == cell["id"]
-                      for point in record.get("dcir50", [])]
+            checkpoints = [record for record in records if record["rpt_link"].get("stage") != "bol"]
+            points = [point for record in checkpoints for point in record.get("dcir50", [])]
+            reference = cells_by_id.get(cell.get("bol_reference_id"), cell)
+            source_records = [record for record in linked.get(reference["id"], [])
+                              if record["rpt_link"].get("stage") == "bol"]
+            source_values = [point["Value"] for record in source_records for point in record.get("dcir50", [])
+                             if isinstance(point.get("Value"), (float, int)) and math.isfinite(point["Value"])
+                             and point["Value"] > 0]
+            baseline = source_values[0] if len(source_values) == 1 else None
             metadata = dict(input_type="study_cell", parse_fingerprint=fingerprint,
                             management_id=cell.get("management_id", cell["name"]), dcir50=points,
-                            status_counts={"CSV": 1, "REVIEW": 1})
+                            has_life=bool(cell["segments"]),
+                            latest_cycle=max((s["end"] for s in cell["segments"]), default=None),
+                            latest_rpt_cycle=max((r["rpt_link"]["cycle"] for r in checkpoints if isinstance(r["rpt_link"].get("cycle"), int)), default=None),
+                            has_bol=any(r["rpt_link"].get("stage") == "bol" for r in records),
+                            timeline=self.timeline(cell["id"]),
+                            reference_bol_cell_id=reference["id"] if source_records else None,
+                            reference_bol_label=_cell_label(reference) if source_records else "",
+                            dcir_baseline_mohm=baseline, status_counts={"CSV": 1, "REVIEW": 1})
             channels.append(ChannelData(cell["id"], cell["name"], str(self.path), store,
-                                        store.step_table(), metadata, store.warnings))
-        from .compact_data import CompactStore
-        from .ingestion import _cache_read
+                                        metadata=metadata, warnings=store.warnings))
         for record in self.data["rpt"]:
             if "store" not in record:
                 continue
@@ -375,11 +484,12 @@ class Study:
             if not path.is_relative_to(self.directory):
                 continue
             try:
-                cached = _cache_read(path, "channel")
-                if cached:
-                    channels.append(ChannelData(record["id"], record["name"], record["path"],
-                                                CompactStore(path), cached[1], dict(cached[2]["metadata"], rpt_link=record.get("rpt_link", {})), cached[3]))
-            except (OSError, ValueError, KeyError):
+                store = CompactStore(path)
+                metadata, warnings = store.channel_metadata()
+                metadata = dict(metadata, rpt_link=record.get("rpt_link", {}))
+                channels.append(ChannelData(record["id"], record["name"], record["path"], store,
+                                            metadata=metadata, warnings=warnings))
+            except (OSError, ValueError, KeyError, TypeError):
                 continue
         return channels
 
@@ -445,10 +555,15 @@ class StudyCellStore:
         from .ingestion import _cache_read
         frames = []
         for _, row_base, raw, segment in self.parts:
-            cached = _cache_read(raw.path, "channel")
-            if cached is None or cached[1].empty:
+            compact_steps = getattr(raw, "steps", None)
+            if compact_steps:
+                steps = compact_steps()
+            else:
+                cached = _cache_read(raw.path, "channel")
+                steps = cached[1] if cached is not None else pd.DataFrame()
+            if steps.empty:
                 continue
-            steps = cached[1].copy()
+            steps = steps.copy()
             if "Cycle" in steps:
                 steps["Source_Cycle"] = steps["Cycle"]
                 steps["Cycle"] = steps["Cycle"].where(steps["Cycle"] < 0, steps["Cycle"] + segment["offset"])
