@@ -43,7 +43,10 @@ def rpt_rows(channel, rules, cancel=None):
         if cancel and cancel():
             raise InterruptedError("RPT 준비 취소")
         name, step, field, operation = (rule[k] for k in ("name", "step", "field", "operation"))
-        segments = _step_segments(by_step.get(step, frame.iloc[:0]))
+        matching = by_step.get(step, frame.iloc[:0])
+        if rule.get("direction"):
+            matching = matching[matching["TypeStd"].eq(rule["direction"])]
+        segments = _step_segments(matching)
         if not segments:
             result.append(dict(Item=name, Step=step, Field=field, Method=operation, Value=None,
                                Status="분석 가능한 Step 없음"))

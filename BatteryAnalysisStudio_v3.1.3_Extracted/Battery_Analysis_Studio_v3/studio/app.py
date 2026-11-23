@@ -1432,27 +1432,42 @@ class StudioWindow(QMainWindow):
         if not channels:
             self.show_error('RPT로 분류한 파일을 먼저 가져오세요.')
             return
+        from .rpt_summary import rpt_summary
+
         dialog = QDialog(self)
-        dialog.setWindowTitle('저장된 RPT 결과')
-        dialog.resize(950, 520)
+        dialog.setWindowTitle('RPT 결과')
+        dialog.resize(1250, 620)
         layout = QVBoxLayout(dialog)
+        tabs = QTabWidget()
+        layout.addWidget(tabs)
+        summary = DataTable()
+        rows = [channel.frame.rpt_rows() for channel in channels]
+        cell_labels = {c.id: f"{c.name} · {c.metadata.get('management_id', c.name)}"
+                       for c in self.channels if c.metadata.get('input_type') == 'study_cell'}
+        summary.set_frame(rpt_summary(channels, rows, cell_labels))
+        tabs.addTab(summary, 'RPT Summary')
+        detail = QWidget()
+        detail_layout = QVBoxLayout(detail)
         selector = QComboBox()
         for channel in channels:
             selector.addItem(f'{channel.name} · {Path(channel.source_path).name}')
-        layout.addWidget(selector)
+        detail_layout.addWidget(selector)
         table = DataTable()
-        layout.addWidget(table)
+        detail_layout.addWidget(table)
+        tabs.addTab(detail, 'Step·펄스 상세')
         def display(index):
-            table.set_frame(pd.DataFrame(channels[index].frame.rpt_rows()))
+            table.set_frame(pd.DataFrame(rows[index]))
         selector.currentIndexChanged.connect(display)
         display(0)
-        button = QPushButton('결과 CSV 저장')
+        button = QPushButton('현재 표 CSV 저장')
         def export():
+            name = 'RPT_Summary.csv' if tabs.currentIndex() == 0 else 'RPT_Details.csv'
             path, _ = QFileDialog.getSaveFileName(dialog, 'RPT 결과 저장',
-                str(Path(default_output_dir()) / 'RPT.csv'), 'CSV (*.csv)')
+                str(Path(default_output_dir()) / name), 'CSV (*.csv)')
             if path:
+                frame = summary.model.frame if tabs.currentIndex() == 0 else table.model.frame
                 try:
-                    table.model.frame.to_csv(path, index=False, encoding='utf-8-sig')
+                    frame.to_csv(path, index=False, encoding='utf-8-sig')
                 except OSError as exc:
                     self.show_error(str(exc))
         button.clicked.connect(export)

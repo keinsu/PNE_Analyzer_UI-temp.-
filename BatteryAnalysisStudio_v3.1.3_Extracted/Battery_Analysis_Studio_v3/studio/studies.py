@@ -330,7 +330,8 @@ class Study:
             if link and not any(c["id"] == link["cell_id"] for c in candidate["cells"]):
                 raise ValueError(f"{channel.name}: 연결할 수명시험 셀이 없습니다.")
             old = next((record for record in candidate["rpt"] if record.get("id") == source_id), None)
-            if old and old.get("fingerprint") == channel.fingerprint and old.get("rpt_link", {}) == link:
+            if old and old.get("fingerprint") == channel.fingerprint and old.get("rpt_link", {}) == link and (
+                    kind != "rpt" or old["store"].endswith("-rpt-energy-v1-compact-v2")):
                 messages.append(f"{channel.name}: 변경 없음")
                 continue
             from .compact_data import prepare_channel

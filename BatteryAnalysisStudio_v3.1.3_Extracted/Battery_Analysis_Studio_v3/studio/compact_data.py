@@ -152,7 +152,9 @@ def prepare_channel(channel, root, cancel=None, *, components=()):
     root = Path(root)
     if isinstance(channel.frame, CompactStore):
         return channel
-    path = root / (channel.fingerprint + "-compact-v2")
+    kind = channel.metadata.get("import_kind", "cycle")
+    version = "-rpt-energy-v1-compact-v2" if kind == "rpt" else "-compact-v2"
+    path = root / (channel.fingerprint + version)
     try:
         cached = _cache_read(path, "channel")
         if cached is not None:
@@ -163,7 +165,6 @@ def prepare_channel(channel, root, cancel=None, *, components=()):
     from shutil import rmtree
     try:
         fixed_dcr = {}
-        kind = channel.metadata.get("import_kind", "cycle")
         from .measurements import rpt_pulses
         extracted = []
         if kind == "rpt":
@@ -171,14 +172,18 @@ def prepare_channel(channel, root, cancel=None, *, components=()):
             extracted = rpt_rows(channel, rules["rpt"], cancel)
             protocol = rules.get("rpt_protocol", {})
             if protocol.get("charge"):
-                capacity_rules = [dict(name=name, step=protocol[key], field="Capacity_mAh", operation="delta")
-                                  for key, name in (("charge", "RPT 충전용량"), ("discharge", "RPT 방전용량"))]
-                parts = rpt_rows(channel, capacity_rules, cancel)
-                for rule in capacity_rules:
+                standard_rules = [
+                    dict(name=f"RPT {direction_label}{kind_label}", step=protocol[key], field=field,
+                         operation="delta", direction=key.upper())
+                    for key, direction_label in (("charge", "충전"), ("discharge", "방전"))
+                    for field, kind_label in (("Capacity_mAh", "용량"), ("Energy_mWh", "에너지"))
+                ]
+                parts = rpt_rows(channel, standard_rules, cancel)
+                for rule in standard_rules:
                     values = [abs(row["Value"]) for row in parts
                               if row["Item"] == rule["name"] and row["Value"] is not None]
-                    extracted.append(dict(Item=rule["name"], Step=rule["step"],
-                                          Value=sum(values) if values else None,
+                    extracted.append(dict(Item=rule["name"], Step=rule["step"], Field=rule["field"],
+                                          Metric=rule["name"], Value=sum(values) if values else None,
                                           Status="계산됨" if values else "측정값 부족"))
                 socs = [float(value.strip()) for value in protocol["soc"].split(",")]
                 extracted.extend(rpt_pulses(analysis_frame(channel), protocol["pulse"], socs, cancel))
@@ -207,7 +212,7 @@ def prepare_channel(channel, root, cancel=None, *, components=()):
         if any(_cache_read(data, f"summary-{label}") is None for label in (0, 1)):
             raise OSError("Cycle 요약을 저장할 수 없습니다.")
         metadata = dict(channel.metadata, compact_curves=True, disk_backed=True, original_rows=channel.row_count,
-                        parse_fingerprint=channel.fingerprint + '-compact-v2')
+                        parse_fingerprint=channel.fingerprint + version)
         _cache_write(data, "channel", (pd.DataFrame(), channel.steps,
                                      {"metadata": metadata, "fixed_dcr": fixed_dcr, "rpt_rows": extracted}, channel.warnings), cancel)
         if _cache_read(data, "channel") is None:

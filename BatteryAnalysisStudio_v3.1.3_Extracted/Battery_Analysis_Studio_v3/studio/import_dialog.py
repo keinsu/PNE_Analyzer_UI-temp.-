@@ -4,8 +4,8 @@ from pathlib import Path
 
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
-    QMessageBox, QPushButton, QScrollArea, QStackedWidget, QVBoxLayout, QWidget)
+    QFormLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QListWidget,
+    QMessageBox, QPushButton, QScrollArea, QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from .import_rules import FIELDS, KINDS, OPERATIONS, apply_rules, step_options
 
@@ -23,7 +23,7 @@ class RuleDialog(QDialog):
     def __init__(self, parent, channels, cycle_only=False, initial=None):
         super().__init__(parent)
         self.setWindowTitle("가져오기 · 파일 분류 및 Step 지정")
-        self.resize(760, 650)
+        self.resize(950, 740)
         self.settings, self.library = _library()
         self.items = []
         self.options = step_options(channels[0])
@@ -41,15 +41,22 @@ class RuleDialog(QDialog):
             if not cycle_only or key == "cycle":
                 self.kind.addItem(label, key)
         form.addRow("파일 분류", self.kind)
-        self.step_list = QListWidget()
-        self.step_list.setMaximumHeight(125)
+        layout.addWidget(QLabel(f"첫 채널의 Step · {len(self.options):,}개"))
+        self.step_list = QTableWidget(len(self.options), 4)
+        self.step_list.setHorizontalHeaderLabels(["Step", "동작", "Cycle 수", "측정점 수"])
+        self.step_list.setMinimumHeight(250)
         self.step_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        self.step_list.setStyleSheet('QListWidget { background: #202d39; color: #f2f6fa; border: 1px solid #71869a; }')
-        for step, mode, cycles, rows in dict.fromkeys(self.options):
-            self.step_list.addItem(f"Step {step} · {mode} · {cycles:,} Cycle · {rows:,}점")
-        form.addRow("첫 채널의 Step", self.step_list)
+        self.step_list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.step_list.setAlternatingRowColors(True)
+        self.step_list.verticalHeader().hide()
+        self.step_list.verticalHeader().setDefaultSectionSize(24)
+        self.step_list.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        for row, (step, mode, cycles, count) in enumerate(self.options):
+            for column, value in enumerate((step, mode, f"{cycles:,}", f"{count:,}")):
+                self.step_list.setItem(row, column, QTableWidgetItem(str(value)))
+        layout.addWidget(self.step_list, 2)
         self.pages = QStackedWidget()
-        layout.addWidget(self.pages)
+        layout.addWidget(self.pages, 1)
         cycle = QWidget()
         cycle_form = QFormLayout(cycle)
         self.capacity = {}
@@ -97,6 +104,19 @@ class RuleDialog(QDialog):
         self.soc_order.setPlaceholderText("펄스 순서대로 입력 · 예: 100,90,80,70,60,50")
         standard.addRow("반복별 SOC (%)", self.soc_order)
         rpt_layout.addLayout(standard)
+        optional = QPushButton("추가 추출 항목 (선택) 펼치기")
+        optional.setCheckable(True)
+        rpt_layout.addWidget(optional)
+        extra = QWidget()
+        custom = QVBoxLayout(extra)
+        custom.setContentsMargins(0, 0, 0, 0)
+        custom.addWidget(QLabel("예: Step 2의 시작 전압을 저장하려면 이름, Step, 전압, 시작값을 지정하세요."))
+        extra.hide()
+        rpt_layout.addWidget(extra)
+        optional.toggled.connect(extra.setVisible)
+        optional.toggled.connect(lambda opened: optional.setText(
+            "추가 추출 항목 (선택) 접기" if opened else "추가 추출 항목 (선택) 펼치기"))
+        self.optional_items = optional
         row = QHBoxLayout()
         self.item_name = QLineEdit()
         self.item_name.setPlaceholderText("결과 이름")
@@ -110,16 +130,18 @@ class RuleDialog(QDialog):
         for widget in (self.item_name, self.step, self.field, self.operation):
             row.addWidget(widget)
         self._button(row, "항목 추가", self.add_item)
-        rpt_layout.addLayout(row)
+        custom.addLayout(row)
         self.item_list = QListWidget()
         self.item_list.currentRowChanged.connect(self.edit_item)
-        rpt_layout.addWidget(self.item_list)
+        self.item_list.setMaximumHeight(95)
+        custom.addWidget(self.item_list)
         item_actions = QHBoxLayout()
         self._button(item_actions, "목록에서 가져오기", self.load_item)
         self._button(item_actions, "선택 항목을 목록에 저장", self.save_item)
         self._button(item_actions, "선택 항목 수정", self.update_item)
         self._button(item_actions, "선택 항목 제외", self.remove_item)
-        rpt_layout.addLayout(item_actions)
+        custom.addLayout(item_actions)
+        rpt_layout.addStretch()
         self.pages.addWidget(rpt)
         self.pages.addWidget(QLabel("곡선은 저장하고 Cycle 용량과 RPT 항목 집계에서는 제외합니다."))
         self.kind.currentTextChanged.connect(lambda: self.pages.setCurrentIndex(list(KINDS).index(self.kind.currentData())))
@@ -173,6 +195,7 @@ class RuleDialog(QDialog):
         self.soc_order.setText(protocol.get("soc", ""))
         self.items = list(rules.get("rpt", []))
         self.show_items()
+        self.optional_items.setChecked(bool(self.items))
 
     def show_items(self):
         self.item_list.clear()
